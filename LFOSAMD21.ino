@@ -1,24 +1,55 @@
-//V1.1
-//March 30 2023
-//Implemented changes suggested by ryokell
-//Out of order divs
-//Non-1 first div
+// V1.2
+// August 12 2026
+// Code refactoring by Onze
 
 #include <FlashAsEEPROM_SAMD.h>
 #include <avr/pgmspace.h>
 #include "antilog.h"
 #include <Arduino.h>
 
-#define TRIANGLE 1
-#define SAW 2
-#define SQUARE 3
-#define RANDOM 4 
 
+// all the constants are now set here as defines
+#define WAVES_NUMBER 5
+#define SQUARE 1
+#define TRIANGLE 2
+#define RAMP_DOWN 3
+#define RAMP_UP 4
+#define RANDOM 5 
+
+// used for filtering the pot and cv values
 #define FREQ 0
 #define POT 1
 
+// button handling stuff
+#define BUTTON_STATE_UP 0
+#define BUTTON_DEBOUNCE_CHECK 1
+#define BUTTON_STATE_PRESSED 2
+#define BUTTON_STATE_LONG_PRESS 3
 
-#define HZPHASOR 91183 //phasor value for 1 hz.
+// times are in milisecs 
+#define BUTTON_PRESS_DEBOUNCE_THRESH 80
+#define BUTTON_PRESS_MID_TIME 1000
+#define BUTTON_PRESS_LONG_TIME 3000
+
+// sync handling stuff
+#define SYNC_THESH_VALUE 370
+#define SYNC_START_STATE 0
+#define SYNC_FIRST_RISING_EDGE 1
+#define SYNC_FIRST_FALLING_EDGE 2
+#define SYNC_NEXT_RISING_EDGE 3
+
+// how it's working generally
+#define CLOCK_MODE_SELF 0
+#define CLOCK_MODE_SYNC 1
+
+// switching between different modes
+#define INTERFACE_MODES_NUMBER 2
+#define INTERFACE_MODE_CLASSIC 0
+#define INTERFACE_MODE_MANUAL 1
+
+// phasor value for 1 hz given the 48 MHz PWM value / 9 bits
+// i'm unsure about how this was calculated to be honest
+#define HZPHASOR 91183
 
 
 long unsigned int accumulator1 = 0;
@@ -41,26 +72,32 @@ FlashStorage(init_storage, char);
 //       Add more if you want!                                                    //
 ////////////////////////////////////////////////////////////////////////////////////
 
+// classic mode definitions
+
 #define DIVSIZE 3 // if you add more divide down arrays, increase this number from 3 (the default number of arrays) to how many arrays you have total  
-char divs[DIVSIZE][4]={{1,3,7,11},
-                      {1,2,4,8},
-                      {1,4,8,16}}; // You could add more divide down arrays here 
+char divs[DIVSIZE][4]={ {1,3,7,11},
+                        {1,2,4,8},
+                        {1,4,8,16} }; // You could add more divide down arrays here 
+
+char waveSelects[4] = { SQUARE, SQUARE, SQUARE, SQUARE };
+
 
 ////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////
 
-char debounceState = 0;
-unsigned long int debounceTime = 0; 
-int waveSelect = 1;
-int divSelect = 1;
+//char buttonState = 0;
+//unsigned long int buttonPressTime = 0;
+//int waveSelect = 1;
+int divSelect = 0;
 unsigned long lastSettingsSave = 0;
 
-bool Mode = 0; // 0 = POT and 1 = SYNC 
+bool ClockMode = CLOCK_MODE_SELF; // 0 = POT and 1 = SYNC 
 float sweepValue;
 long unsigned int Time1 = 0;
 long unsigned int Time2 = 0; 
 long unsigned int Periud = 0; // Period (arduino didn't allow use of word "period")
 float syncFrequency = 0; 
+
 void timerIsr();
 void setupTimers();
 void TCC0_Handler();
@@ -68,7 +105,8 @@ void TCC0_Handler();
 
 
 // +++++++++++++++++++++++++++++++++++ SETUP ++++++++++++++++++++++++++++++++++++++++
-void setup() {
+void setup()
+{
   pinMode(1, OUTPUT);
   pinMode(9, OUTPUT);
   pinMode(2, OUTPUT);
@@ -80,26 +118,31 @@ void setup() {
   //Serial.begin(9600);
   setupTimers(); //  **this may not be the right location
   randomSeed(analogRead(A8));
-  
-   
 }
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++ MAIN LOOP +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-void loop() {
+void loop()
+{
+  static char interfaceMode = INTERFACE_MODE_CLASSIC;
+  static char selectedWave = SQUARE;
   
-  static int modeCounter = 0;
-  bool lastButtonState = 0;
-  static bool buttonState = 0;
-  static int syncState = 0; // used to find find the leading edge to calculate period (static so it isn't updated to zero each loop)
+  static int syncPopOutCounter = 0;
+  //bool lastButtonState = 0;
+  //static bool buttonState = BUTTON_STATE_UP;
+
+  static char buttonState = 0;
+  static unsigned long int buttonPressTime = 0;
+
+  static int syncState = SYNC_START_STATE; // used to find find the leading edge to calculate period (static so it isn't updated to zero each loop)
   static int syncCounter = 0;
-  int Sync; 
+  int SyncRead; 
 
 ////////////////////////////////////////////////////////////////////////////////////
 //       "EEPROM" Save                                                            //
 //       Store the settings after 60 seconds                                      //
 ////////////////////////////////////////////////////////////////////////////////////
-  if((millis() - (lastSettingsSave)) > (60000))
+  if ((millis() - (lastSettingsSave)) > (60000))
   {
     saveSettings();
     lastSettingsSave = millis();
@@ -109,126 +152,173 @@ void loop() {
 //        Sync mode                                                               //
 //       sync the 1:1 output with an incoming signal                              //
 ////////////////////////////////////////////////////////////////////////////////////
-     Sync = analogRead(A10); // CV2 pin A10 on XIAO 
-  
-    if((Sync < 370) && (syncState == 0)){ //if analog read CV2 is less than 370 RISING EDGE
-      Time1 = micros(); // Capture the time 
-      syncState = 1;  // set syncState to 1 
-      //This only enters on the first pulse received,
-      //following pulses alternate between syncstate 2 and 3
-      
-    }
+  SyncRead = analogRead(A10); // CV2 pin A10 on XIAO 
 
-    else if((Sync > 370) && (syncState == 1)){ //FALLING
-     
-      syncState = 2; 
-    
-     }
-
-    else if((Sync < 370) && (syncState == 2)){ //NEXT RISING EDGE
-      syncState = 3;
-      Time2 = micros();
-      Mode = 1;
-      Periud = (Time2 - Time1); // Find the period by subtracting Time2 from Time1 
-      syncFrequency = 1000000;
-      syncFrequency = syncFrequency/Periud; // NEW FREQUENCY HERE 
-      
-      if(divs[divSelect-1][0] == 1)
-      {
-        //if the first divider is 1, clear acc 1 every rising edge to keep synced
-        accumulator1=0;
-      }
-      if(divs[divSelect-1][1] == 1)
-      {
-        //if the second divider is 1, clear acc 2
-        accumulator2=0;
-      }
-      if(divs[divSelect-1][2] == 1)
-      {
-        //if the third divider is 1, clear acc 3
-        accumulator3=0;
-      }
-      if(divs[divSelect-1][3] == 1)
-      {
-        //if the fourth divider is 1, clear acc 4
-        accumulator4=0;
-      }
-      
-      Time1 = Time2;
-      
-      
-      if(syncCounter == 0)  //first time calculation, clear all accs so waveform starts at 0 and begins synced
-      {
-        accumulator1=0;
-        accumulator2=0;  
-        accumulator3=0;
-        accumulator4=0;
-      }
-
-      if(syncCounter%divs[divSelect-1][0] == 0){ // div 1
-        accumulator1 = 0;
-      }
-
-      if(syncCounter%divs[divSelect-1][1] == 0){ // div 2
-        accumulator2 = 0;
-      }
-
-      if(syncCounter%divs[divSelect-1][2] == 0){ // div 3
-        accumulator3 = 0;
-      }
-
-      if(syncCounter%divs[divSelect-1][3] ==0){ // div 4
-        accumulator4 = 0;
-      }
-    
-
-      if((syncCounter%divs[divSelect-1][0] == 0) && (syncCounter%divs[divSelect-1][1] == 0) && (syncCounter%divs[divSelect-1][2] == 0) && (syncCounter%divs[divSelect-1][3] == 0)){
-        syncCounter = 0;
-        
-      }
-      syncCounter++;
-
-    }
-    
-    else if((Sync > 370) && (syncState == 3)){ // last falling edge
-     syncState = 2;
-     
-     }   
-
-   ////////////////////////////////////////////////////////////
-   //                END OF SYNC STUFF                       //  
-   ////////////////////////////////////////////////////////////
-     
-   if(digitalRead(6)==LOW && debounceState ==0){ //button has been pressed and hasn't been previously pressed                           
-      debounceState = 1;   //real button press?
-      debounceTime = millis();
-   }
-
-   else if(debounceState == 1){
-    if((millis() - debounceTime) > 80){
-        if(digitalRead(6) == LOW){
-          debounceState = 2;
-        }
-        else{
-          debounceState = 0;
-        }
-      }
+  if ((SyncRead < SYNC_THESH_VALUE) && (syncState == SYNC_START_STATE))
+  {
+    //if analog read CV2 is less than 370 : RISING EDGE
+    Time1 = micros(); // Capture the time 
+    syncState = SYNC_FIRST_RISING_EDGE;  // set syncState to 1 
+    //This only enters on the first pulse received,
+    //following pulses alternate between syncstate 2 and 3
   }
 
-   else if(debounceState == 2){
-      if(digitalRead(6) == HIGH){
-          debounceState = 0;
-          if((millis() - debounceTime) < 3000){ //short press to change waveform
-           waveSelect++;  //move to the next waveform
-              if(waveSelect>4){ //if we're trying to select more than 4 waveforms, cycle back to the 1st
-                 waveSelect=1;
-              }
-          }
-      }
-        else if((millis() - debounceTime) > 3000)  //long press to change divisions
+  else if ((SyncRead > SYNC_THESH_VALUE) && (syncState == SYNC_FIRST_RISING_EDGE))
+  {
+    //FALLING
+    syncState = SYNC_FIRST_FALLING_EDGE; 
+  }
+
+  else if ((SyncRead < SYNC_THESH_VALUE) && (syncState == SYNC_FIRST_FALLING_EDGE))
+  {
+    //NEXT RISING EDGE - compute the frequency
+    syncState = SYNC_NEXT_RISING_EDGE;
+    Time2 = micros();
+    ClockMode = CLOCK_MODE_SYNC;
+    Periud = (Time2 - Time1); // Find the period by subtracting Time2 from Time1 
+    // convert the period into a frequency
+    syncFrequency = 1000000 / Periud; // NEW FREQUENCY HERE 
+    
+    /*
+    // this next section is probably useless because I believe that it's computed in the next part.
+    // (i believe that in C, N%1==0 every time)
+    // for now, I'm leaving it there, but commenting out
+    if(divs[divSelect-1][0] == 1)
+    {
+      //if the first divider is 1, clear acc 1 every rising edge to keep synced
+      accumulator1=0;
+    }
+    if(divs[divSelect-1][1] == 1)
+    {
+      //if the second divider is 1, clear acc 2
+      accumulator2=0;
+    }
+    if(divs[divSelect-1][2] == 1)
+    {
+      //if the third divider is 1, clear acc 3
+      accumulator3=0;
+    }
+    if(divs[divSelect-1][3] == 1)
+    {
+      //if the fourth divider is 1, clear acc 4
+      accumulator4=0;
+    }*/
+    
+    // frequency has been calculated, prepare for the next pulse
+    Time1 = Time2;
+    
+    
+    if (syncCounter == 0)  //first time calculation, clear all accs so waveform starts at 0 and begins synced
+    {
+      accumulator1=0;
+      accumulator2=0;  
+      accumulator3=0;
+      accumulator4=0;
+    }
+
+    // i have the impression that this accumulator reset is necessary only because in the phasor calculation,
+    // we don't have the guarantee that phasor values are multiples
+    if (syncCounter % divs[divSelect][0] == 0)
+      // div 1
+      accumulator1 = 0;
+
+    if (syncCounter % divs[divSelect][1] == 0)
+      // div 2
+      accumulator2 = 0;
+
+    if (syncCounter % divs[divSelect][2] == 0)
+      // div 3
+      accumulator3 = 0;
+
+    if (syncCounter % divs[divSelect][3] == 0)
+      // div 4
+      accumulator4 = 0;
+  
+
+    //if((syncCounter%divs[divSelect-1][0] == 0) && (syncCounter%divs[divSelect-1][1] == 0) && (syncCounter%divs[divSelect-1][2] == 0) && (syncCounter%divs[divSelect-1][3] == 0)){
+    if ( (accumulator1==0) && (accumulator2==0) && (accumulator3==0) && (accumulator4==0) )
+      // avoid accumulating values into syncCounter and getting an overflow (I suppose)
+      syncCounter = 0;
+
+    syncCounter++;
+
+  }
+  
+  else if ((SyncRead > SYNC_THESH_VALUE) && (syncState == SYNC_NEXT_RISING_EDGE))
+  {
+    // already in syncing mode, prepare for the next pulse
+    syncState = SYNC_FIRST_FALLING_EDGE; 
+  }
+
+  ////////////////////////////////////////////////////////////
+  //                   END OF SYNC STUFF                    //
+  ////////////////////////////////////////////////////////////
+
+
+
+
+  ////////////////////////////////////////////////////////////
+  //                 BUTTON HANDLING STUFF                  //
+  ////////////////////////////////////////////////////////////
+
+  if (buttonState==BUTTON_STATE_UP && digitalRead(6)==LOW )
+  {
+    //button has just been pressed and hasn't been previously pressed                           
+    buttonState = BUTTON_DEBOUNCE_CHECK;   //real button press?
+    buttonPressTime = millis();
+  }
+
+  else if (buttonState == BUTTON_DEBOUNCE_CHECK )
+  {
+    if ((millis() - buttonPressTime) > BUTTON_PRESS_DEBOUNCE_THRESH)
+    {
+      if (digitalRead(6) == LOW)
+        buttonState = BUTTON_STATE_PRESSED;
+      else
+        buttonState = BUTTON_STATE_UP;
+    }
+  }
+
+  else if (buttonState == BUTTON_STATE_PRESSED)
+  {
+    if (digitalRead(6) == HIGH)
+    {
+      // button has been released
+      buttonState = BUTTON_STATE_UP;
+
+      // checking the time since the last press
+      if ((millis() - buttonPressTime) < BUTTON_PRESS_MID_TIME)
+      {
+        //short press
+        if (interfaceMode == INTERFACE_MODE_CLASSIC)
         {
-          debounceState = 3;
-          debounceTime=millis();
+          // if in classic mode: change all the waves altogether to match the first one
+          char newWaveSelect = (waveSelects[0] % WAVES_NUMBER) + 1;  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
+
+          // apply to all the waves
+          waveSelects[0] = newWaveSelect;
+          waveSelects[1] = newWaveSelect;
+          waveSelects[2] = newWaveSelect;
+          waveSelects[3] = newWaveSelect;
+        }
+        else if (interfaceMode == INTERFACE_MODE_MANUAL)
+        {
+          // only change the selected wave 
+          waveSelects[selectedWave] = (waveSelects[selectedWave] % WAVES_NUMBER) + 1;
+        }
+        //short press to change waveform
+        //char waveSelect = (waveSelects[0] % WAVES_NUMBER) + 1;  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
+                                                       // the logical calculation would be waveSelec
+           //waveSelect++;  //move to the next waveform
+           //   if(waveSelect>4){ //if we're trying to select more than 4 waveforms, cycle back to the 1st
+           //      waveSelect=1;
+           //   }
+      }
+      else if ((millis() - buttonPressTime) <= BUTTON_PRESS_LONG_TIME)  //medium time press
+      {
+        // medium time press and release to change divisions
+        if (interfaceMode == INTERFACE_MODE_CLASSIC)
+        {
           accumulator1=0; 
           accumulator2=0; 
           accumulator3=0; 
@@ -237,153 +327,222 @@ void loop() {
           phasor2 = 0;
           phasor3 = 0;
           phasor4 = 0;
-          delay(2000);
           
-          divSelect++;
-            if(divSelect>DIVSIZE){
-               divSelect=1;
-            }
-
+          // pausing to show that something has happened
+          delay(800);
+          
+          divSelect = (divSelect + 1) % DIVSIZE;
         }
-      
-   }
-  else if(debounceState == 3){  //holding only
-    if((millis() - debounceTime) > 3000)  //long press
+        else if (interfaceMode == INTERFACE_MODE_MANUAL)
         {
-          debounceState = 3;
-          debounceTime=millis();
-          divSelect++;
-            if(divSelect>3){
-               divSelect=1;
-            }
+          // just change the selected wave
+          selectedWave = (selectedWave + 1) % 4;
 
+          // now what we need to do is add the manual mode to the pot handling to change the divisions or stuff like that
         }
-      else if(digitalRead(6) == HIGH)
-      {
-          debounceState = 0;
+
       }
+      else if ((millis() - buttonPressTime) > BUTTON_PRESS_LONG_TIME)
+      {
+        // long time press to change interface mode
+        buttonState = BUTTON_STATE_LONG_PRESS;
+        buttonPressTime = millis();
+
+        // change the interface mode
+        interfaceMode = (interfaceMode + 1) % INTERFACE_MODES_NUMBER;
+
+        if (interfaceMode == INTERFACE_MODE_MANUAL)
+          // we just switched to the manual mode, selectedWave has to be the first one
+          selectedWave = 0;
+        
+        //divSelect++;
+        //if (divSelect>DIVSIZE) {
+        //  divSelect=1;
+        ///}
+
+      }
+    }
   }
+  else if (buttonState == BUTTON_STATE_LONG_PRESS)
+  {
+    if ((millis() - buttonPressTime) > BUTTON_PRESS_LONG_TIME)
+    {
+      // long press, cycling through
+      // divSelect = (divSelect + 1) % DIVSIZE;
+      interfaceMode = (interfaceMode + 1) % INTERFACE_MODES_NUMBER;
+
+      // reinitializing the time for the next cycle
+      buttonPressTime = millis();
+    }
+    else if (digitalRead(6) == HIGH)
+    {
+      buttonState = BUTTON_STATE_UP;
+    }
+  }
+
+  ////////////////////////////////////////////////////////////
+  //              END OF BUTTON HANDLING STUFF              //
+  ////////////////////////////////////////////////////////////
   
-   
+  
+
+
+
+  ////////////////////////////////////////////////////////////
+  //           READ THE POT AND FREQ CV-IN VALUES           //
+  ////////////////////////////////////////////////////////////
    
   float tempphasor;
   int cv1Value; // to store value of cv1 (Frequency)
   static int potValue; // to store the value of the potentiometer
-  
   static int oldpotValue; 
-  filterPut(POT,analogRead(A0));
+
+  // read the potentiometer value
+  // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
+  filterPut(POT, analogRead(A0));
   potValue = filterGet(POT);
-  //Serial.println(potValue);
+  
 
   //This section pops us out of sync mode
-  modeCounter++;
-  if(modeCounter>100) //do this only every 100 samples
+  syncPopOutCounter++;
+  if (syncPopOutCounter > 100) //do this only every 100 samples
   {
-    if((potValue - oldpotValue)> 20 || (oldpotValue - potValue) > 20){
-    Mode = 0; 
+    // actually what this seems to do is verify if the pot value is quickly changed, rather than changed at all
+    // this is not necessarily an issue
+    if ((potValue - oldpotValue)> 20 || (oldpotValue - potValue) > 20)
+    {
+      ClockMode = CLOCK_MODE_SELF; 
     }
 
     oldpotValue = potValue;
-
-    modeCounter = 0;
+    syncPopOutCounter = 0;
   }
 
-  filterPut(FREQ,analogRead(A4));
-  cv1Value = filterGet(FREQ);; // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
+  // read the freq cv value
+  // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
+  filterPut(FREQ, analogRead(A4));
+  cv1Value = filterGet(FREQ);
   
-  cv1Value = 1023-cv1Value; // so we want to invert it (making -12V correspond to 0V on the XIAO)
+  // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
+  // we center the value around 0
+  
+  cv1Value = 1023 - cv1Value; // so we want to invert it (making -12V correspond to 0V on the XIAO)
   cv1Value = cv1Value - 565;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
   
-  if(Mode == 1){ //better way to update sweepvalue with sync frequency
-  sweepValue = syncFrequency;
+
+
+
+
+
+  ////////////////////////////////////////////////////////////
+  //              UPDATE THE PHASER INCREMENTS              //
+  ////////////////////////////////////////////////////////////
+
+  if (ClockMode == CLOCK_MODE_SYNC)
+  {
+    //better way to update sweepvalue with sync frequency
+    sweepValue = syncFrequency;
   }
   else
   {
-      if( (Mode == 0) && ( (cv1Value > 20) || (cv1Value < -20) )  ){// Don't want the frequency to be considered if the cv input is close to 0 (+/- 20) 
-        int totalcv = potValue+cv1Value;
-        if(totalcv <0)
-          totalcv = 0;
-        else if(totalcv>1023)
-          totalcv = 1023;
-          
-        sweepValue=pgm_read_float_near(hzcurve + totalcv);
-      }
-      else
-        sweepValue=pgm_read_float_near(hzcurve + potValue);
+    int totalcv = potValue;
 
+    // the device is self-clocked
+    if ( (ClockMode == CLOCK_MODE_SELF) && ((cv1Value > 20) || (cv1Value < -20)) )
+    {
+      // Don't want the frequency cv input to be considered if it is close to 0 (+/- 20)
+      // (actually, is it that relevant???)
+      totalcv += cv1Value;
+      if (totalcv < 0)
+        totalcv = 0;
+      else if (totalcv > 1023)
+        totalcv = 1023;
+    }
+      
+    // read the frequency value in the antilog.h table.
+    // hzcurve is a lut table, so +totalcv provides the position in the table
+    sweepValue = pgm_read_float_near(hzcurve + totalcv);
   }
 
+  // tempphasor is the fastest increment according to the general clock
+  tempphasor = sweepValue * HZPHASOR;
 
-
-
-  tempphasor=sweepValue*HZPHASOR;
-
-
- 
-  phasor1=(unsigned long int)tempphasor/divs[divSelect-1][0];
-  phasor2=(unsigned long int)tempphasor/divs[divSelect-1][1]; // dividing down for the slower outputs 
-  phasor3=(unsigned long int)tempphasor/divs[divSelect-1][2];
-  phasor4=(unsigned long int)tempphasor/divs[divSelect-1][3];
-
+  // update the individual values with their corresponding dividers
+  phasor1 = (unsigned long int) (tempphasor / divs[divSelect][0]);
+  phasor2 = (unsigned long int) (tempphasor / divs[divSelect][1]); // dividing down for the slower outputs 
+  phasor3 = (unsigned long int) (tempphasor / divs[divSelect][2]);
+  phasor4 = (unsigned long int) (tempphasor / divs[divSelect][3]);
 }
+
+
+
+
+
 
 // +++++++++++++++++++++++++++++++++++++++++ FUNCTION DEFINITIONS ++++++++++++++++++++++++++++++++++
 
+// previous_acc is used to store the last known acc value
+// it's useful to know when we start a new cycle, for the random steps generation
 unsigned long int previous_acc[4];
 
-unsigned int generator(unsigned long int acc, char waveshape, char channel) {
-//December 12 - Adjusted for 9 bit
-//unsigned char shifted_acc = acc>>24;
-unsigned int shifted_acc = acc>>23;
-#define HALFPOINT 255
-#define MAXPOINT 511
+unsigned int generator(unsigned long int acc, char waveshape, char channel)
+{
+  //December 12 - Adjusted for 9 bit
+  //unsigned char shifted_acc = acc>>24;
+  
+  // unsigned long int is using 32 bits
+  // so we keep the 9 outmost bits and base our calculation on those
+  
+  unsigned int shifted_acc = acc>>23;
+  #define HALFPOINT 255
+  #define MAXPOINT 511
 
-  if (waveshape == SQUARE) {
-    if ((shifted_acc)>HALFPOINT) {
-      return MAXPOINT;
-    }
-    else
-    {
-      return 0;
-    }
-  }
-
-  if (waveshape == SAW) {
-   return(shifted_acc);
-  }
-
-  if (waveshape == TRIANGLE){
-    if ((shifted_acc)<=HALFPOINT)
+  switch(waveshape)
+  {
+    case SQUARE:
+      if (shifted_acc > HALFPOINT)
       {
-        return ((shifted_acc<<1));
+        return MAXPOINT;
       }
-    /*else if (shifted_acc == HALFPOINT){
-      return 512;  
-    }*/
-    else //greater than HALFPOINT
-    {
-      return ((MAXPOINT-(shifted_acc))<<1);
-      
-    }
-  }
-  // WANT TO IMPLEMENT RANDOM SQUARE WAVESHAPE HERE 
-
-   if(waveshape == RANDOM) {
-    
-      if(shifted_acc < previous_acc[channel] ) // Do this so we only update everytime we loop around the accumulator
+      else
       {
-        randNum[channel] = random(MAXPOINT);
-        
+        return 0;
+      }
+
+    case RAMP_DOWN:
+      return shifted_acc;
+
+    case RAMP_UP:
+      return MAXPOINT - shifted_acc;
+
+    case TRIANGLE:
+      if (shifted_acc <= HALFPOINT)
+      {
+        return (shifted_acc<<1);
+      }
+      else //greater than HALFPOINT
+      {
+        return ((MAXPOINT - shifted_acc)<<1);      
       }
     
+    case RANDOM:
+      if (shifted_acc < previous_acc[channel])
+      // Do this so we only update when we cycle around the accumulator
+      {
+        randNum[channel] = random(MAXPOINT);      
+      }
+
       previous_acc[channel] = shifted_acc;  
-      return randNum[channel]; 
- 
-   }
+      return randNum[channel];
 
+    default:
+      return 0;
+  }
+  
   return 0;
-     
 }
+
+
 
 void setupTimers() // used to set up fast PWM on pins 1,9,2,3
 {
@@ -434,7 +593,7 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3
   while (TCC0->SYNCBUSY.bit.CC1);                   // Wait for synchronization
   REG_TCC0_CC0 = 50;                             // TCC1 CC0 - on D11 50% pin 1
   while (TCC0->SYNCBUSY.bit.CC0);                   // Wait for synchronization
-    REG_TCC0_CC2 = 200;                             // TCC1 CC1 - on D3  50% pin 2
+  REG_TCC0_CC2 = 200;                             // TCC1 CC1 - on D3  50% pin 2
   while (TCC0->SYNCBUSY.bit.CC2);                   // Wait for synchronization
   REG_TCC0_CC3 = 254;                             // TCC1 CC0 - on D11 50% pin 3
   while (TCC0->SYNCBUSY.bit.CC3);                   // Wait for synchronization
@@ -450,23 +609,27 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3
 
   NVIC_EnableIRQ(TCC0_IRQn);
   TCC0->CTRLA.reg |= TCC_CTRLA_ENABLE ;
-  
 }
+
 
 void TCC0_Handler() 
 {
-  if (TCC0->INTFLAG.bit.CNT == 1) { //*************************************************
-   accumulator1 = accumulator1 + phasor1;
-   accumulator2 = accumulator2 + phasor2;
-   accumulator3 = accumulator3 + phasor3;
-   accumulator4 = accumulator4 + phasor4;
-   delayMicroseconds(6);
-   REG_TCC0_CC0 = generator(accumulator1, waveSelect,3); // pin 9 //#4
-   REG_TCC0_CC1 = generator(accumulator4, waveSelect,0); // pin 2 //#1
-   REG_TCC0_CC2 = generator(accumulator2, waveSelect,1); // pin 1 //#2  
-   REG_TCC0_CC3 = generator(accumulator3, waveSelect,2); // pin 3 //#3
+  if (TCC0->INTFLAG.bit.CNT == 1)
+  {
+    //*************************************************
+    accumulator1 = accumulator1 + phasor1;
+    accumulator2 = accumulator2 + phasor2;
+    accumulator3 = accumulator3 + phasor3;
+    accumulator4 = accumulator4 + phasor4;
+    delayMicroseconds(6);
 
-   TCC0->INTFLAG.bit.CNT = 1; //*******************************************************
+    REG_TCC0_CC0 = generator(accumulator1, waveSelects[0], 0); // pin 9 //#4
+    REG_TCC0_CC1 = generator(accumulator4, waveSelects[1], 3); // pin 2 //#1
+    REG_TCC0_CC2 = generator(accumulator2, waveSelects[2], 1); // pin 1 //#2  
+    REG_TCC0_CC3 = generator(accumulator3, waveSelects[3], 2); // pin 3 //#3
+
+    TCC0->INTFLAG.bit.CNT = 1;
+    //*******************************************************
   }
 }
 
@@ -476,39 +639,55 @@ void readSettings (void)
   char x;
   char c = 'S';
   int y = 1;
+  int z = SQUARE;
+
   init_storage.read(x);
-  if(x == 'S')  //S means eeprom has been initialized.
+
+  if (x == 'S')  //S means eeprom has been initialized.
   {
-    wave_storage.read(waveSelect);
+    wave_storage.read(z);
+    waveSelects[0] = z;
+    waveSelects[1] = z;
+    waveSelects[2] = z;
+    waveSelects[3] = z;
+    //wave_storage.read(waveSelects[1]);
+    //wave_storage.read(waveSelects[2]);
+    //wave_storage.read(waveSelects[3]);
     div_storage.read(divSelect);
   }
   else
   {
     //we initialize, no 'S' found
     init_storage.write(c);  //use variables because this library hates constants
-    wave_storage.write(y);
+    wave_storage.write(z);
     div_storage.write(y);
-    divSelect = 1;
-    waveSelect = 1;
+    divSelect = 0;
+    //waveSelect = 1;
+    waveSelects[0] = z;
+    waveSelects[1] = z;
+    waveSelects[2] = z;
+    waveSelects[3] = z;
   }
-
 }
+
 
 void saveSettings (void)
 {
   int x;
+
+  // only store the value if it's different from the previous stored value
   wave_storage.read(x);
-  
-  if(x != waveSelect)
-    wave_storage.write(waveSelect);  // <-- save the waveSelect 
+  if (x != waveSelects[0])
+  {
+    x = waveSelects[0];
+    wave_storage.write(x);  // <-- save the waveSelect 
+  }
 
-   div_storage.read(x);
-  
-  if(x != divSelect)
-    div_storage.write(divSelect);  // <-- save the waveSelect  
-  
-
+  div_storage.read(x);
+  if (x != divSelect)
+    div_storage.write(divSelect);  // <-- save the divSelect  
 }
+
 
 #define NUMREADINGS 50
 unsigned int pot[NUMREADINGS];
@@ -516,22 +695,22 @@ unsigned int freq[NUMREADINGS];
 
 void filterPut (char input, unsigned int newreading)
 {
-  static unsigned char potptr=0;
+  static unsigned char potptr = 0;
   static unsigned char freqptr = 0;
 
-  if(input == POT)
+  if (input == POT)
   {
     pot[potptr] = newreading;
     potptr++;
-    if(potptr >= NUMREADINGS)
+    if (potptr >= NUMREADINGS)
       potptr=0;
   }
 
-  else if(input == FREQ)
+  else if (input == FREQ)
   {
     freq[freqptr] = newreading;
     freqptr++;
-    if(freqptr >= NUMREADINGS)
+    if (freqptr >= NUMREADINGS)
       freqptr = 0;
   }
   
@@ -544,14 +723,14 @@ unsigned int filterGet (bool input)
   unsigned char y;
 
   x = 0;
-  if(input == POT)
+  if (input == POT)
   {
     for (y=0;y<NUMREADINGS;y++)
     {
       x = x + pot[y];
     }
   }
-  else if(input == FREQ)
+  else if (input == FREQ)
   {
     for (y=0;y<NUMREADINGS;y++)
     {
@@ -560,7 +739,7 @@ unsigned int filterGet (bool input)
   }
 
   z = x;
-  z = z/NUMREADINGS;
+  z = z / NUMREADINGS;
   z = z + 0.5;
   return (unsigned int)z;
 }
