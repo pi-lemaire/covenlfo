@@ -5,67 +5,44 @@
 #include <FlashAsEEPROM_SAMD.h>
 #include <avr/pgmspace.h>
 #include "antilog.h"
+#include "coven_defs.h"
 #include <Arduino.h>
 
 
-// all the constants are now set here as defines
-#define WAVES_NUMBER 5
-#define SQUARE 1
-#define TRIANGLE 2
-#define RAMP_DOWN 3
-#define RAMP_UP 4
-#define RANDOM 5 
-
-// used for filtering the pot and cv values
-#define FREQ 0
-#define POT 1
-
-// button handling stuff
-#define BUTTON_STATE_UP 0
-#define BUTTON_DEBOUNCE_CHECK 1
-#define BUTTON_STATE_PRESSED 2
-#define BUTTON_STATE_LONG_PRESS 3
-
-// times are in milisecs 
-#define BUTTON_PRESS_DEBOUNCE_THRESH 80
-#define BUTTON_PRESS_MID_TIME 1000
-#define BUTTON_PRESS_LONG_TIME 3000
-
 // sync handling stuff
 #define SYNC_THESH_VALUE 370
-#define SYNC_START_STATE 0
-#define SYNC_FIRST_RISING_EDGE 1
-#define SYNC_FIRST_FALLING_EDGE 2
-#define SYNC_NEXT_RISING_EDGE 3
 
-// how it's working generally
-#define CLOCK_MODE_SELF 0
-#define CLOCK_MODE_SYNC 1
-
-// switching between different modes
-#define INTERFACE_MODES_NUMBER 2
-#define INTERFACE_MODE_CLASSIC 0
-#define INTERFACE_MODE_MANUAL 1
 
 // phasor value for 1 hz given the 48 MHz PWM value / 9 bits
-// i'm unsure about how this was calculated to be honest
-#define HZPHASOR 91183
+#define HZPHASOR 91446
+// original value : #define HZPHASOR 91183
+
+// the calculation is the following:
+// baseclock is 48 Mhz
+// TCC0 interrupts happen every 2x511 cycle of this master-clock
+// so the frequency of TCC0 is 46967 Hz
+// we want phasor to reach the long unsigned int overflow after one increment every TCC0 interrupt
+// long unsigned int max is 2^32-1 = 4294967295
+// so HZPhasor is 4294967295/46967 = 91446.49
 
 
-long unsigned int accumulator1 = 0;
-long unsigned int accumulator2 = 0;
-long unsigned int accumulator3 = 0;
-long unsigned int accumulator4 = 0;
-long unsigned int phasor1;
-long unsigned int phasor2;
-long unsigned int phasor3;
-long unsigned int phasor4;
+volatile uint32_t accumulator1 = 0;
+volatile uint32_t accumulator2 = 0;
+volatile uint32_t accumulator3 = 0;
+volatile uint32_t accumulator4 = 0;
+volatile uint32_t phasor1;
+volatile uint32_t phasor2;
+volatile uint32_t phasor3;
+volatile uint32_t phasor4;
 
-char randNum[4];
+// store the same random value for a whole period
+volatile uint16_t randNum[4];
 
+// the flash storage handler will need to be updated at some point
 FlashStorage(div_storage, int);
 FlashStorage(wave_storage, int);
 FlashStorage(init_storage, char);
+
 
 ////////////////////////////////////////////////////////////////////////////////////
 //       DIVIDE DOWN ARRAYS                                                       //
@@ -74,12 +51,14 @@ FlashStorage(init_storage, char);
 
 // classic mode definitions
 
-#define DIVSIZE 3 // if you add more divide down arrays, increase this number from 3 (the default number of arrays) to how many arrays you have total  
+constexpr uint8_t DIVSIZE = 3;
+
 char divs[DIVSIZE][4]={ {1,3,7,11},
                         {1,2,4,8},
                         {1,4,8,16} }; // You could add more divide down arrays here 
 
-char waveSelects[4] = { SQUARE, SQUARE, SQUARE, SQUARE };
+
+CovenWaves waveSelects[4] = { CovenWaves::Square, CovenWaves::Square, CovenWaves::Square, CovenWaves::Square };
 
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -89,18 +68,15 @@ char waveSelects[4] = { SQUARE, SQUARE, SQUARE, SQUARE };
 //unsigned long int buttonPressTime = 0;
 //int waveSelect = 1;
 int divSelect = 0;
-unsigned long lastSettingsSave = 0;
 
-bool ClockMode = CLOCK_MODE_SELF; // 0 = POT and 1 = SYNC 
 float sweepValue;
-long unsigned int Time1 = 0;
-long unsigned int Time2 = 0; 
-long unsigned int Periud = 0; // Period (arduino didn't allow use of word "period")
-float syncFrequency = 0; 
+volatile float syncFrequency = 1.; 
 
+// not sure those ar really useful
 void timerIsr();
 void setupTimers();
 void TCC0_Handler();
+// void TCC1_Handler();
 
 
 
@@ -113,31 +89,382 @@ void setup()
   pinMode(3, OUTPUT);
   pinMode(13, OUTPUT); // using pin 13 to check interupt on timer 1
   pinMode(6, INPUT_PULLUP); // pin 7 pushbutton to select waveform
-  pinMode(A10, INPUT); //used for analogReading sync (cv2) 
+  //pinMode(A10, INPUT); //used for analogReading sync (cv2) 
+  pinMode(10, INPUT); //used for analogReading sync (cv2) 
   readSettings();
+  randomSeed(analogRead(A8));
   //Serial.begin(9600);
   setupTimers(); //  **this may not be the right location
-  randomSeed(analogRead(A8));
+  //randomSeed(analogRead(A8));
 }
+
+
+
+
+////////////////////////////////////////////////////////////
+//                 BUTTON HANDLING STUFF                  //
+////////////////////////////////////////////////////////////
+
+
+ButtonState getButtonState(void)
+{
+  //static char buttonState = BUTTON_STATE_UP;
+  static ButtonState knownState = ButtonState::Released;
+  static unsigned long int buttonPressTime = 0;
+
+  if ( (knownState==ButtonState::Released) && (digitalRead(6)==LOW) )
+  {
+    // button has just been pressed and hasn't been previously pressed
+    // we activate a flag (sort of) allowing us to state that we're in debounce check mode
+    knownState = ButtonState::Debounce_Check;
+    buttonPressTime = millis();
+    return ButtonState::Undefined;
+  }
+  else if (knownState == ButtonState::Debounce_Check)
+  {
+    // we're in check mode, verify if enough time has elapsed
+    if ((millis() - buttonPressTime) > ButtonPressTimeDebounce)
+    {
+      // yes : is the button still pressed?
+      if (digitalRead(6) == LOW)
+        // yes: ok this is not a bounce - next we will look at the time
+        knownState = ButtonState::Pressed;
+      else
+        // no: this was not a real press
+        knownState = ButtonState::Released;
+        return ButtonState::Undefined;
+    }
+  }
+
+  if ((knownState == ButtonState::Pressed) || (knownState == ButtonState::Long_Press))
+  {
+    // 3 options:
+    // 1. release before mid time : short press
+    // 2. release after mid time but before long time : medium press
+    // 3. exceeded long time : long press, even without a release
+
+    unsigned long int currentTime = millis();
+
+    if (digitalRead(6) == HIGH)
+    {
+      bool previously_not_long = (knownState == ButtonState::Pressed);
+
+      // button has been released, store it into the status straight away
+      knownState = ButtonState::Released;
+
+      // checking the time since the last press
+      // ShortPress and MediumPress are only going to happen if it wasn't a long press already
+      if (previously_not_long && ((currentTime - buttonPressTime) < ButtonPressTimeMid))
+        //short press
+        return ButtonState::Short_Press;
+      else if (previously_not_long && ((currentTime - buttonPressTime) <= ButtonPressTimeLong))
+        // medium press
+        return ButtonState::Medium_Press;
+      else if ((currentTime - buttonPressTime) > ButtonPressTimeLong)
+        // avoid the unlikely event when the actual release happens before the check
+        buttonPressTime = currentTime;
+        return ButtonState::Long_Press;
+    }
+    else if ((currentTime - buttonPressTime) > ButtonPressTimeLong)
+    {
+      // this is a long press. We cycle through, but we also need to change the status
+      buttonPressTime = currentTime;
+      knownState = ButtonState::Long_Press;
+      return ButtonState::Long_Press;
+    }
+  }
+
+  // return undefined: 
+  return ButtonState::Undefined;
+}
+
+
+
+
+
+
+
+///////////////////////////////////////////////////////////
+//        Sync related stuff                             //
+//       sync the 1:1 output with an incoming signal     //
+///////////////////////////////////////////////////////////
+
+
+// number of sync verifications before deciding that it's possible that we leave the sync mode
+constexpr uint8_t SYNCDUMMYCHECKS = 100;
+
+
+// now the general sync handling is performed through an object
+// the advantage of doing this is that it can be called from either the main loop or an IRC
+// and that some variables stay hidden. Within the loop, we just call the ReadTrigger function
+// and we read the active / inactivate status, and also we know when a pulse just happened
+// getting out of sync mode is also handled through the class, by providing the pot value
+
+class SyncHandler {
+public:
+  bool readTriggerCV()
+  {
+    // read the sync trigger input, and finds out the sync state mode
+    // this method must to be called either into the main loop,
+    // either in an ISR for better timing, but cannot be read by both concurrently
+
+    // returns True if it just received a trigger and entered sync mode
+
+    // store the timing between 2 pulses
+    static long unsigned int Time1 = micros();
+
+    // read the input
+    bool SyncUpState = (analogRead(A10) < SYNC_THESH_VALUE); // CV2 pin A10 on XIAO
+    // analogRead is rather slow, it's better to replace it with a digitalRead
+    // since it's much faster and thus relevant for synchronization
+    // bool SyncUpState = (digitalRead(10) == LOW); // CV2 pin A10 on XIAO
+    
+    // all the following is to detect state change
+    if (SyncUpState && (syncState==SyncState::Unsync))
+    {
+      // if we've received a gate/trigger, and we haven't had any before
+      Time1 = micros(); // Capture the time 
+      syncState = SyncState::FirstRisingEdge;
+
+      return false;
+    }
+    else if (!SyncUpState && (syncState==SyncState::FirstRisingEdge))
+    {
+      //FALLING
+      syncState = SyncState::FirstFallingEdge;
+
+      return false;
+    }
+    else if (SyncUpState && (syncState==SyncState::FirstFallingEdge))
+    {
+      if (!active)
+      {
+        // we've just changed state, record it
+        checksCounter = 0;
+        syncCounter = 0;
+      }
+
+      // we're in sync mode now
+      active = true;
+
+      // calculate the period
+      uint32_t Time2 = micros();
+      period = Time2 - Time1;
+      Time1 = Time2;
+      // TODO: check what is susceptible of happening when an overflow happens, and find a strategy to counter that
+      
+      // frequency has been calculated, prepare for the next pulse
+      //NEXT RISING EDGE - compute the frequency
+      syncState = SyncState::NextRisingEdge;
+      
+      // we've just received a pulse, return this information
+      return true;
+    }
+    
+    else if (!SyncUpState && (syncState == SyncState::NextRisingEdge))
+    {
+      // already in syncing mode, prepare for the next pulse
+      syncState = SyncState::FirstFallingEdge;
+
+      return false;
+    }
+
+    // none of the above: no state changed, return false and don't change anything, be yourself, forever
+    return false;
+  }
+
+  void checkSyncMode(uint16_t potValue)
+  {
+    if (!active)
+    {
+      // not supposed to happen
+      return;
+    }
+    else if (checksCounter==0)
+    {
+      // first check, store the potValue
+      knownPotValue = potValue;
+      checksCounter++;
+    }
+    else if (checksCounter<SYNCDUMMYCHECKS)
+      checksCounter++;
+    else
+    {
+      if ((potValue - knownPotValue)> 20 || (knownPotValue - potValue) > 20)
+      {
+        active = false;
+        syncState = SyncState::Unsync;
+      }
+    }
+  }
+
+  bool isActive() const
+  {
+    return active;
+  }
+
+  uint32_t getPeriod() const
+  {
+    // avoid corrupted returns since period is a multi-byte value
+    // susceptible of being shared and modify between main loop and ISR
+    noInterrupts();
+    uint32_t p = period;
+    interrupts();
+    return p;
+  }
+
+  uint8_t getSyncCounter() const
+  {
+    return syncCounter;
+  }
+
+  void resetSyncCounter()
+  {
+    syncCounter = 0;
+  }
+
+  void incSyncCounter()
+  {
+    ++syncCounter;
+  }
+
+private:
+    volatile bool active = false;
+    volatile SyncState syncState = SyncState::Unsync;
+    volatile uint32_t period = 0;
+    volatile uint8_t checksCounter = 0;
+    uint16_t knownPotValue = 0; // not volatile because it only needs to be read to and from the main loop
+    uint8_t syncCounter = 0;
+};
+
+// global object used to handle the sync
+// for now it's handled in the main loop, so it may be static into the main loop
+// but the main goal is to handle it into the TCC1 loop for better accuracy
+SyncHandler sync; 
+
+
+
+
+
+// handle a CV input: accumulate values, and provide their mean value
+// this is a direct replacement of the former filterPut and filterGet functions
+
+constexpr uint8_t CVBitWiseTableSize = 5;                   // 2^5=32 is going to be the table size. If you want more filtering, you may
+                                                            // try with 6 instead (filter on the 64 last read values)
+constexpr uint8_t CVTableSize = 0x01 << CVBitWiseTableSize; // 32 - The point is to avoid a time-consuming division by replacing it with a shift
+
+class CVInHandler {
+public:
+  explicit CVInHandler(uint8_t pin) : pin_to_read(pin)
+  {
+    for (uint8_t i = 0; i < CVTableSize; ++i)
+      cv_readings[i] = 0;
+  }
+
+  uint16_t readCV()
+  {
+    // the basic idea is to always have the sum stored, and just modify it by replacing the
+    // oldest value by the newer one, like in a fifo pile
+    // if the table size is power of 2, division is just a shift register, which is much faster
+    int16_t new_value = analogRead(pin_to_read);
+    summed_values -= cv_readings[cursor];
+    summed_values += new_value;
+
+    cv_readings[cursor] = new_value;
+
+    cursor = (cursor + 1) & (CVTableSize - 1); // equivalent to %CVTableSize in this context
+
+    return (summed_values >> CVBitWiseTableSize);
+  }
+
+  private:
+    uint8_t cursor = 0;
+    uint8_t pin_to_read;
+    int32_t summed_values = 0;
+    int16_t cv_readings[CVTableSize];
+};
+
+
+
+
+
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++ MAIN LOOP +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 void loop()
 {
-  static char interfaceMode = INTERFACE_MODE_CLASSIC;
-  static char selectedWave = SQUARE;
+  // default values for the interface:
+  static CovenAlgo interfaceMode = CovenAlgo::Classic;
+  static int selectedWave = 0;
+
+  // check if we want to 
+  unsigned long lastSettingsSave = 0;
+
+
+  static CVInHandler PotReader(A0);
+  static CVInHandler FreqReader(A4);
+
   
-  static int syncPopOutCounter = 0;
-  //bool lastButtonState = 0;
-  //static bool buttonState = BUTTON_STATE_UP;
+  // evaluate the sync status
+  bool gotAPulse = sync.readTriggerCV();
 
-  static char buttonState = 0;
-  static unsigned long int buttonPressTime = 0;
+  if (gotAPulse)
+  {
+    // we've just got an actual pulse from the sync input
+    // we probably have to update the frequency
 
-  static int syncState = SYNC_START_STATE; // used to find find the leading edge to calculate period (static so it isn't updated to zero each loop)
-  static int syncCounter = 0;
-  int SyncRead; 
+    // convert the period time (in microseconds) in Hz
+    // note: we probably don't have to go into hertz territory here
+    syncFrequency = 1000000 / static_cast<float>(sync.getPeriod()); // NEW FREQUENCY HERE, IN HERTZ
 
+    // also reset the phasers when needed
+    uint8_t syncCount = sync.getSyncCounter();
+
+    if (syncCount == 0)  //first time sync, clear all accs so waveform starts at 0 and begins synced
+    {
+      accumulator1=0;
+      accumulator2=0;  
+      accumulator3=0;
+      accumulator4=0;
+    }
+    else
+    {
+      // store reset values because accumulator values may be changed by an interrupt before the end of the block
+      bool rst_1=false, rst_2=false, rst_3=false, rst_4=false;
+      if (syncCount % divs[divSelect][0] == 0)
+      {
+        // div 1
+        accumulator1 = 0;
+        rst_1 = true;
+      }
+      if (syncCount % divs[divSelect][1] == 0)
+      {
+        // div 2
+        accumulator2 = 0;
+        rst_2 = true;
+      }
+      if (syncCount % divs[divSelect][2] == 0)
+      {
+        // div 3
+        accumulator3 = 0;
+        rst_3 = true;
+      }
+      if (syncCount % divs[divSelect][3] == 0)
+      {
+        // div 4
+        accumulator4 = 0;
+        rst_4 = true;
+      }
+
+      if (rst_1 && rst_2 && rst_3 && rst_4)
+        // avoid accumulating values into syncCount and getting an overflow (I suppose)
+        sync.resetSyncCounter();
+      else
+        sync.incSyncCounter();
+    }
+  }
+
+  
 ////////////////////////////////////////////////////////////////////////////////////
 //       "EEPROM" Save                                                            //
 //       Store the settings after 60 seconds                                      //
@@ -148,237 +475,75 @@ void loop()
     lastSettingsSave = millis();
   }
   
-////////////////////////////////////////////////////////////////////////////////////
-//        Sync mode                                                               //
-//       sync the 1:1 output with an incoming signal                              //
-////////////////////////////////////////////////////////////////////////////////////
-  SyncRead = analogRead(A10); // CV2 pin A10 on XIAO 
-
-  if ((SyncRead < SYNC_THESH_VALUE) && (syncState == SYNC_START_STATE))
-  {
-    //if analog read CV2 is less than 370 : RISING EDGE
-    Time1 = micros(); // Capture the time 
-    syncState = SYNC_FIRST_RISING_EDGE;  // set syncState to 1 
-    //This only enters on the first pulse received,
-    //following pulses alternate between syncstate 2 and 3
-  }
-
-  else if ((SyncRead > SYNC_THESH_VALUE) && (syncState == SYNC_FIRST_RISING_EDGE))
-  {
-    //FALLING
-    syncState = SYNC_FIRST_FALLING_EDGE; 
-  }
-
-  else if ((SyncRead < SYNC_THESH_VALUE) && (syncState == SYNC_FIRST_FALLING_EDGE))
-  {
-    //NEXT RISING EDGE - compute the frequency
-    syncState = SYNC_NEXT_RISING_EDGE;
-    Time2 = micros();
-    ClockMode = CLOCK_MODE_SYNC;
-    Periud = (Time2 - Time1); // Find the period by subtracting Time2 from Time1 
-    // convert the period into a frequency
-    syncFrequency = 1000000 / Periud; // NEW FREQUENCY HERE 
-    
-    /*
-    // this next section is probably useless because I believe that it's computed in the next part.
-    // (i believe that in C, N%1==0 every time)
-    // for now, I'm leaving it there, but commenting out
-    if(divs[divSelect-1][0] == 1)
-    {
-      //if the first divider is 1, clear acc 1 every rising edge to keep synced
-      accumulator1=0;
-    }
-    if(divs[divSelect-1][1] == 1)
-    {
-      //if the second divider is 1, clear acc 2
-      accumulator2=0;
-    }
-    if(divs[divSelect-1][2] == 1)
-    {
-      //if the third divider is 1, clear acc 3
-      accumulator3=0;
-    }
-    if(divs[divSelect-1][3] == 1)
-    {
-      //if the fourth divider is 1, clear acc 4
-      accumulator4=0;
-    }*/
-    
-    // frequency has been calculated, prepare for the next pulse
-    Time1 = Time2;
-    
-    
-    if (syncCounter == 0)  //first time calculation, clear all accs so waveform starts at 0 and begins synced
-    {
-      accumulator1=0;
-      accumulator2=0;  
-      accumulator3=0;
-      accumulator4=0;
-    }
-
-    // i have the impression that this accumulator reset is necessary only because in the phasor calculation,
-    // we don't have the guarantee that phasor values are multiples
-    if (syncCounter % divs[divSelect][0] == 0)
-      // div 1
-      accumulator1 = 0;
-
-    if (syncCounter % divs[divSelect][1] == 0)
-      // div 2
-      accumulator2 = 0;
-
-    if (syncCounter % divs[divSelect][2] == 0)
-      // div 3
-      accumulator3 = 0;
-
-    if (syncCounter % divs[divSelect][3] == 0)
-      // div 4
-      accumulator4 = 0;
   
-
-    //if((syncCounter%divs[divSelect-1][0] == 0) && (syncCounter%divs[divSelect-1][1] == 0) && (syncCounter%divs[divSelect-1][2] == 0) && (syncCounter%divs[divSelect-1][3] == 0)){
-    if ( (accumulator1==0) && (accumulator2==0) && (accumulator3==0) && (accumulator4==0) )
-      // avoid accumulating values into syncCounter and getting an overflow (I suppose)
-      syncCounter = 0;
-
-    syncCounter++;
-
-  }
-  
-  else if ((SyncRead > SYNC_THESH_VALUE) && (syncState == SYNC_NEXT_RISING_EDGE))
-  {
-    // already in syncing mode, prepare for the next pulse
-    syncState = SYNC_FIRST_FALLING_EDGE; 
-  }
-
-  ////////////////////////////////////////////////////////////
-  //                   END OF SYNC STUFF                    //
-  ////////////////////////////////////////////////////////////
-
-
 
 
   ////////////////////////////////////////////////////////////
   //                 BUTTON HANDLING STUFF                  //
   ////////////////////////////////////////////////////////////
 
-  if (buttonState==BUTTON_STATE_UP && digitalRead(6)==LOW )
-  {
-    //button has just been pressed and hasn't been previously pressed                           
-    buttonState = BUTTON_DEBOUNCE_CHECK;   //real button press?
-    buttonPressTime = millis();
-  }
+  // get the type of button action with this function
+  ButtonState currentButtonState = getButtonState();
 
-  else if (buttonState == BUTTON_DEBOUNCE_CHECK )
+  // act accordingly
+  if (currentButtonState == ButtonState::Short_Press)
   {
-    if ((millis() - buttonPressTime) > BUTTON_PRESS_DEBOUNCE_THRESH)
+    if (interfaceMode == CovenAlgo::Classic)
     {
-      if (digitalRead(6) == LOW)
-        buttonState = BUTTON_STATE_PRESSED;
-      else
-        buttonState = BUTTON_STATE_UP;
+      // if in classic mode: change all the waves altogether to match the first one
+      CovenWaves newWaveSelect = waveSelects[0];  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
+      ++newWaveSelect;
+
+      // apply to all the waves
+      waveSelects[0] = newWaveSelect;
+      waveSelects[1] = newWaveSelect;
+      waveSelects[2] = newWaveSelect;
+      waveSelects[3] = newWaveSelect;
+    }
+    else if ((interfaceMode == CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
+    {
+      // only change the selected wave 
+      ++(waveSelects[selectedWave]); // = (waveSelects[selectedWave] % WAVES_NUMBER) + 1;
     }
   }
-
-  else if (buttonState == BUTTON_STATE_PRESSED)
+  else if (currentButtonState == ButtonState::Medium_Press)
   {
-    if (digitalRead(6) == HIGH)
+    // medium time press and release to change divisions
+    if (interfaceMode == CovenAlgo::Classic)
     {
-      // button has been released
-      buttonState = BUTTON_STATE_UP;
+      accumulator1=0; 
+      accumulator2=0; 
+      accumulator3=0; 
+      accumulator4=0;
+      phasor1 = 0;
+      phasor2 = 0;
+      phasor3 = 0;
+      phasor4 = 0;
+      
+      // pausing to show that something has happened
+      delay(800);
+      // TODO : replace this delay by some additional led display
+      
+      divSelect = (divSelect + 1) % DIVSIZE;
+    }
+    else if ((interfaceMode==CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
+    {
+      // just change the selected wave
+      selectedWave = (selectedWave + 1) % 4;
 
-      // checking the time since the last press
-      if ((millis() - buttonPressTime) < BUTTON_PRESS_MID_TIME)
-      {
-        //short press
-        if (interfaceMode == INTERFACE_MODE_CLASSIC)
-        {
-          // if in classic mode: change all the waves altogether to match the first one
-          char newWaveSelect = (waveSelects[0] % WAVES_NUMBER) + 1;  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
-
-          // apply to all the waves
-          waveSelects[0] = newWaveSelect;
-          waveSelects[1] = newWaveSelect;
-          waveSelects[2] = newWaveSelect;
-          waveSelects[3] = newWaveSelect;
-        }
-        else if (interfaceMode == INTERFACE_MODE_MANUAL)
-        {
-          // only change the selected wave 
-          waveSelects[selectedWave] = (waveSelects[selectedWave] % WAVES_NUMBER) + 1;
-        }
-        //short press to change waveform
-        //char waveSelect = (waveSelects[0] % WAVES_NUMBER) + 1;  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
-                                                       // the logical calculation would be waveSelec
-           //waveSelect++;  //move to the next waveform
-           //   if(waveSelect>4){ //if we're trying to select more than 4 waveforms, cycle back to the 1st
-           //      waveSelect=1;
-           //   }
-      }
-      else if ((millis() - buttonPressTime) <= BUTTON_PRESS_LONG_TIME)  //medium time press
-      {
-        // medium time press and release to change divisions
-        if (interfaceMode == INTERFACE_MODE_CLASSIC)
-        {
-          accumulator1=0; 
-          accumulator2=0; 
-          accumulator3=0; 
-          accumulator4=0;
-          phasor1 = 0;
-          phasor2 = 0;
-          phasor3 = 0;
-          phasor4 = 0;
-          
-          // pausing to show that something has happened
-          delay(800);
-          
-          divSelect = (divSelect + 1) % DIVSIZE;
-        }
-        else if (interfaceMode == INTERFACE_MODE_MANUAL)
-        {
-          // just change the selected wave
-          selectedWave = (selectedWave + 1) % 4;
-
-          // now what we need to do is add the manual mode to the pot handling to change the divisions or stuff like that
-        }
-
-      }
-      else if ((millis() - buttonPressTime) > BUTTON_PRESS_LONG_TIME)
-      {
-        // long time press to change interface mode
-        buttonState = BUTTON_STATE_LONG_PRESS;
-        buttonPressTime = millis();
-
-        // change the interface mode
-        interfaceMode = (interfaceMode + 1) % INTERFACE_MODES_NUMBER;
-
-        if (interfaceMode == INTERFACE_MODE_MANUAL)
-          // we just switched to the manual mode, selectedWave has to be the first one
-          selectedWave = 0;
-        
-        //divSelect++;
-        //if (divSelect>DIVSIZE) {
-        //  divSelect=1;
-        ///}
-
-      }
+      // now what we need to do is add the manual mode to the pot handling to change the divisions or stuff like that
     }
   }
-  else if (buttonState == BUTTON_STATE_LONG_PRESS)
+  else if (currentButtonState == ButtonState::Long_Press)
   {
-    if ((millis() - buttonPressTime) > BUTTON_PRESS_LONG_TIME)
-    {
-      // long press, cycling through
-      // divSelect = (divSelect + 1) % DIVSIZE;
-      interfaceMode = (interfaceMode + 1) % INTERFACE_MODES_NUMBER;
+    // change the interface mode
+    ++interfaceMode; // = (interfaceMode + 1) % ALGOS_Number;
 
-      // reinitializing the time for the next cycle
-      buttonPressTime = millis();
-    }
-    else if (digitalRead(6) == HIGH)
-    {
-      buttonState = BUTTON_STATE_UP;
-    }
+    if ((interfaceMode==CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
+      // we just switched to the manual mode, selectedWave has to be the first one
+      selectedWave = 0;
   }
+
 
   ////////////////////////////////////////////////////////////
   //              END OF BUTTON HANDLING STUFF              //
@@ -399,38 +564,12 @@ void loop()
 
   // read the potentiometer value
   // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
-  filterPut(POT, analogRead(A0));
-  potValue = filterGet(POT);
-  
-
-  //This section pops us out of sync mode
-  syncPopOutCounter++;
-  if (syncPopOutCounter > 100) //do this only every 100 samples
-  {
-    // actually what this seems to do is verify if the pot value is quickly changed, rather than changed at all
-    // this is not necessarily an issue
-    if ((potValue - oldpotValue)> 20 || (oldpotValue - potValue) > 20)
-    {
-      ClockMode = CLOCK_MODE_SELF; 
-    }
-
-    oldpotValue = potValue;
-    syncPopOutCounter = 0;
-  }
-
-  // read the freq cv value
-  // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
-  filterPut(FREQ, analogRead(A4));
-  cv1Value = filterGet(FREQ);
-  
-  // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
-  // we center the value around 0
-  
-  cv1Value = 1023 - cv1Value; // so we want to invert it (making -12V correspond to 0V on the XIAO)
-  cv1Value = cv1Value - 565;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
-  
+  //filterPut(POT, analogRead(A0));
+  potValue = PotReader.readCV(); //filterGet(POT);
 
 
+  if (sync.isActive())
+    sync.checkSyncMode(potValue);
 
 
 
@@ -438,7 +577,8 @@ void loop()
   //              UPDATE THE PHASER INCREMENTS              //
   ////////////////////////////////////////////////////////////
 
-  if (ClockMode == CLOCK_MODE_SYNC)
+  //if (ClockMode == CovenClockMode::Sync)
+  if (sync.isActive())
   {
     //better way to update sweepvalue with sync frequency
     sweepValue = syncFrequency;
@@ -447,8 +587,21 @@ void loop()
   {
     int totalcv = potValue;
 
+    // read the freq cv value (useless when in sync mode)
+    // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
+    //filterPut(FREQ, analogRead(A4));
+    cv1Value = FreqReader.readCV(); //filterGet(FREQ);
+    
+    // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
+    // we center the value around 0
+    
+    cv1Value = 1023 - cv1Value; // so we want to invert it (making -12V correspond to 0V on the XIAO)
+    cv1Value = cv1Value - 512;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
+    //cv1Value = cv1Value - 565;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
+    
+
     // the device is self-clocked
-    if ( (ClockMode == CLOCK_MODE_SELF) && ((cv1Value > 20) || (cv1Value < -20)) )
+    if ( (cv1Value > 20) || (cv1Value < -20) ) 
     {
       // Don't want the frequency cv input to be considered if it is close to 0 (+/- 20)
       // (actually, is it that relevant???)
@@ -463,6 +616,9 @@ void loop()
     // hzcurve is a lut table, so +totalcv provides the position in the table
     sweepValue = pgm_read_float_near(hzcurve + totalcv);
   }
+
+  // testing the value of HZPHASOR, we force the main clock to be 1 Hz
+  // sweepValue = 440;
 
   // tempphasor is the fastest increment according to the general clock
   tempphasor = sweepValue * HZPHASOR;
@@ -484,8 +640,10 @@ void loop()
 // previous_acc is used to store the last known acc value
 // it's useful to know when we start a new cycle, for the random steps generation
 unsigned long int previous_acc[4];
+// constexpr uint16_t HALFPOINT = 255;
+// constexpr uint16_t MAXPOINT = 511;
 
-unsigned int generator(unsigned long int acc, char waveshape, char channel)
+uint16_t generator(unsigned long int acc, CovenWaves waveshape, uint8_t channel, bool& justCycled)
 {
   //December 12 - Adjusted for 9 bit
   //unsigned char shifted_acc = acc>>24;
@@ -493,13 +651,23 @@ unsigned int generator(unsigned long int acc, char waveshape, char channel)
   // unsigned long int is using 32 bits
   // so we keep the 9 outmost bits and base our calculation on those
   
-  unsigned int shifted_acc = acc>>23;
-  #define HALFPOINT 255
-  #define MAXPOINT 511
+  constexpr uint16_t HALFPOINT = 255;
+  constexpr uint16_t MAXPOINT = 511;
+
+  //unsigned int shifted_acc = acc>>23;
+  uint16_t shifted_acc = static_cast<uint16_t>(acc>>23);
+
+  // store the prev_acc now so that we can update previous_acc.
+  // This is useful for the sync flag
+  unsigned long int prev_acc = previous_acc[channel];
+  previous_acc[channel] = shifted_acc;
+
+  // inform the parent caller that we just cycled through this wave
+  justCycled = (shifted_acc < prev_acc);
 
   switch(waveshape)
   {
-    case SQUARE:
+    case CovenWaves::Square:
       if (shifted_acc > HALFPOINT)
       {
         return MAXPOINT;
@@ -509,30 +677,32 @@ unsigned int generator(unsigned long int acc, char waveshape, char channel)
         return 0;
       }
 
-    case RAMP_DOWN:
+    case CovenWaves::RampDown:
       return shifted_acc;
 
-    case RAMP_UP:
+    case CovenWaves::RampUp:
       return MAXPOINT - shifted_acc;
 
-    case TRIANGLE:
+    case CovenWaves::Triangle:
       if (shifted_acc <= HALFPOINT)
       {
         return (shifted_acc<<1);
       }
       else //greater than HALFPOINT
       {
-        return ((MAXPOINT - shifted_acc)<<1);      
+        return ((MAXPOINT + 1 - shifted_acc) << 1); // +1 because if shifted_acc==MAXPOINT, we shift 0 and end up with an undesired value
       }
     
-    case RANDOM:
-      if (shifted_acc < previous_acc[channel])
+    case CovenWaves::Random:
+      if (shifted_acc < prev_acc)
       // Do this so we only update when we cycle around the accumulator
       {
+        // this is probably quite wrong regarding the timing needed to compute a random() in an interrupt
+        // TODO : change this behaviour by generating random numbers in the main loop and just retrieving the value here
         randNum[channel] = random(MAXPOINT);      
       }
 
-      previous_acc[channel] = shifted_acc;  
+      //previous_acc[channel] = shifted_acc;  
       return randNum[channel];
 
     default:
@@ -543,8 +713,28 @@ unsigned int generator(unsigned long int acc, char waveshape, char channel)
 }
 
 
+/*
+// Variables globales pour le clignotement gere dans TCC1_Handler
+volatile bool led_D5_State = false;
+volatile uint32_t blink_D5_Counter = 0;
 
-void setupTimers() // used to set up fast PWM on pins 1,9,2,3
+volatile bool led_D8_State = false;
+volatile uint32_t blink_D8_Counter = 0;
+
+// Nombre d'overflows de TCC1 pour atteindre 0.5s
+// Frequence TCC1 = Fgclk / (2 * N * PER) ~ 94000 Hz (voir calcul plus bas, PER=0xFF donc 8 bits)
+// => Pour 0.5s : ~94000 * 0.5 ~ 47000 overflows (a ajuster si vous changez PRESCALER ou PER)
+#define BLINK_D5_OVERFLOW_COUNT 47000
+
+// D8 est en simple GPIO on/off, clignotement gere par le meme handler TCC1 (comme reference
+// de temps), mais avec son propre compteur et sa propre periode -> totalement independant de D5.
+#define BLINK_D8_OVERFLOW_COUNT 47000   // Meme periode que D5 par defaut ; changez cette valeur pour desynchroniser
+
+// Rapport cyclique (8 bits, 0-255) pour D5 uniquement
+#define LED_D5_DUTY 180   // ~70%
+*/
+
+void setupTimers() // used to set up fast PWM on pins 1,9,2,3 (TCC0) + D5 (TCC1, PWM) + D8 (GPIO on/off)
 {
  
   REG_GCLK_GENDIV = GCLK_GENDIV_DIV(2) |          //// Divide the 48MHz clock source by divisor N=1: 48MHz/1=48MHz
@@ -569,13 +759,35 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3
   PORT->Group[g_APinDescription[2].ulPort].PMUX[g_APinDescription[2].ulPin >> 1].reg |= PORT_PMUX_PMUXE_F;  // D3 is on PA11 = odd
   PORT->Group[g_APinDescription[3].ulPort].PMUX[g_APinDescription[3].ulPin >> 1].reg |= PORT_PMUX_PMUXO_F; // D11 is on PA08 = even
 
- 
+  
+  /*
+  // --- AJOUT : configuration de D5 (PA09) en PWM via TCC1 ---
+  // D5 = PA09 -> fonction F = TCC1/WO[3], duplique depuis CC1 (confirme fonctionnel)
+  PORT->Group[g_APinDescription[5].ulPort].PINCFG[g_APinDescription[5].ulPin].bit.PMUXEN = 1;
+  PORT->Group[g_APinDescription[5].ulPort].PMUX[g_APinDescription[5].ulPin >> 1].reg |= PORT_PMUX_PMUXO_F; // D5 = PA09 impair -> TCC1/WO[3]
+  // --- FIN AJOUT D5 ---
+
+  // --- AJOUT : configuration de D8 (PA07) en simple GPIO de sortie (pas de PWM, pas de PMUX) ---
+  // On NE touche PAS au PINCFG.PMUXEN ici : en le laissant a 0 (valeur par defaut), la broche
+  // reste sous controle direct du PORT (GPIO classique), ce qui est exactement ce qu'il faut
+  // pour un pilotage on/off simple, independant de tout timer.
+  PORT->Group[g_APinDescription[7].ulPort].DIRSET.reg = (1 << (g_APinDescription[7].ulPin % 32)); // D8 en sortie
+  PORT->Group[g_APinDescription[7].ulPort].OUTCLR.reg = (1 << (g_APinDescription[7].ulPin % 32)); // D8 eteinte au demarrage
+  // --- FIN AJOUT D8 ---
+  */
+  
 
   // Feed GCLK4 to TCC0 and TCC1
   REG_GCLK_CLKCTRL = GCLK_CLKCTRL_CLKEN |         // Enable GCLK4 to TCC0 and TCC1
                      GCLK_CLKCTRL_GEN_GCLK0 |     // Select GCLK4 //0 only works for interrup?
                      GCLK_CLKCTRL_ID_TCC0_TCC1;   // Feed GCLK4 to TCC0 and TCC1
   while (GCLK->STATUS.bit.SYNCBUSY);              // Wait for synchronization
+  // NOTE : TCC0 et TCC1 partagent le meme bus de clock generique (ID_TCC0_TCC1),
+  // donc la ligne ci-dessus alimente deja TCC1 avec la meme horloge que TCC0 (GCLK0, 48MHz).
+  // C'est ici (GCLK_CLKCTRL_GEN_GCLKx) qu'il faudrait changer la source si on voulait
+  // une frequence differente entre TCC0 et TCC1 - mais comme ils sont sur le meme ID
+  // TCC0_TCC1, il faudrait en realite les decoupler autrement (ce n'est pas fait ici
+  // puisqu'on garde volontairement la meme horloge pour les deux).
 
 
   // Dual slope PWM operation: timers countinuously count up to PER register value then down 0
@@ -605,33 +817,122 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3
   
   TCC0->INTENSET.reg = 0;
   TCC0->INTENSET.bit.CNT = 1;  //*****************************************************
-  TCC0->INTENSET.bit.MC0 = 0;
+  //TCC0->INTENSET.bit.OVF = 1;  //*****************************************************
+  //TCC0->INTENSET.bit.MC0 = 0;
 
   NVIC_EnableIRQ(TCC0_IRQn);
+  NVIC_SetPriority(TCC0_IRQn, 0);   // High priority (0 = highest)
   TCC0->CTRLA.reg |= TCC_CTRLA_ENABLE ;
+
+  /*
+  // below is the code to enable the second interrupt TCC1
+  // ================= AJOUT : configuration TCC1 (D5 uniquement, 8 bits) =================
+
+  // Meme principe que TCC0 : mode dual slope PWM
+  REG_TCC1_WAVE |= TCC_WAVE_POL(0x3) |            // Inverse la polarite sur les sorties de TCC1
+                    TCC_WAVE_WAVEGEN_DSBOTH;      // Dual slope PWM sur TCC1
+  while (TCC1->SYNCBUSY.bit.WAVE);                // Attente de synchronisation
+
+  // Resolution 8 bits -> PER = 0xFF = 255 (256 pas)
+  REG_TCC1_PER = 0xFF;                            // TOP = 255 => resolution 8 bits
+  while (TCC1->SYNCBUSY.bit.PER);                 // Attente de synchronisation
+
+  REG_TCC1_CC1 = LED_D5_DUTY;                     // Rapport cyclique de D5 (WO[3], duplique depuis CC1)
+  while (TCC1->SYNCBUSY.bit.CC1);                 // Attente de synchronisation
+
+  // Meme prescaler que TCC0 (DIV1) : la clock source est identique, mais PER etant plus petit
+  // (8 bits au lieu de 9), la frequence de decoupage de TCC1 sera plus elevee que celle de TCC0.
+  // NOTE : c'est ICI (TCC_CTRLA_PRESCALER_DIVx) qu'on peut ralentir TCC1 sans toucher a sa
+  // resolution 8 bits, par exemple en passant a TCC_CTRLA_PRESCALER_DIV2, DIV4, DIV8, etc.
+  REG_TCC1_CTRLA |= TCC_CTRLA_PRESCALER_DIV1 |
+                    TCC_CTRLA_ENABLE;
+  while (TCC1->SYNCBUSY.bit.ENABLE);              // Attente de synchronisation
+
+  // Interruption sur overflow (OVF) du compteur TCC1, utilisee pour le clignotement
+  // de D5 (PWM) ET de D8 (GPIO), chacune avec son propre compteur -> independantes.
+  TCC1->INTENSET.reg = 0;
+  TCC1->INTENSET.bit.OVF = 1;
+
+  NVIC_EnableIRQ(TCC1_IRQn);
+  NVIC_SetPriority(TCC1_IRQn, 1);   // Priorité haute (0 = la plus prioritaire)
+  TCC1->CTRLA.reg |= TCC_CTRLA_ENABLE;
+  // ================= FIN AJOUT TCC1 =================
+  */
 }
 
 
 void TCC0_Handler() 
 {
-  if (TCC0->INTFLAG.bit.CNT == 1)
+  if (TCC0->INTFLAG.bit.CNT)
+  //if (TCC0->INTFLAG.bit.OVF)
   {
     //*************************************************
     accumulator1 = accumulator1 + phasor1;
     accumulator2 = accumulator2 + phasor2;
     accumulator3 = accumulator3 + phasor3;
     accumulator4 = accumulator4 + phasor4;
-    delayMicroseconds(6);
+    // delayMicroseconds(6);
 
-    REG_TCC0_CC0 = generator(accumulator1, waveSelects[0], 0); // pin 9 //#4
-    REG_TCC0_CC1 = generator(accumulator4, waveSelects[1], 3); // pin 2 //#1
-    REG_TCC0_CC2 = generator(accumulator2, waveSelects[2], 1); // pin 1 //#2  
-    REG_TCC0_CC3 = generator(accumulator3, waveSelects[3], 2); // pin 3 //#3
+    // the cycle/reset calculation should happen here
+    // it can be driven
+    bool justCycled;
+
+
+    REG_TCC0_CC0 = generator(accumulator1, waveSelects[0], 0, justCycled); // pin 9 //#4
+    // if there's some sort of sync to perform between the first wave and the other,
+    // just do it here.
+    REG_TCC0_CC2 = generator(accumulator2, waveSelects[1], 1, justCycled); // pin 1 //#2  
+    REG_TCC0_CC3 = generator(accumulator3, waveSelects[2], 2, justCycled); // pin 3 //#3
+    REG_TCC0_CC1 = generator(accumulator4, waveSelects[3], 3, justCycled); // pin 2 //#1
 
     TCC0->INTFLAG.bit.CNT = 1;
+    //TCC0->INTFLAG.bit.OVF = 1;
     //*******************************************************
   }
 }
+
+
+
+/*
+
+// Handler d'interruption de TCC1 : appele a chaque overflow du compteur.
+// Sert de base de temps commune pour clignoter D5 (PWM, via CC1) et D8 (GPIO on/off),
+// mais avec deux compteurs et deux periodes separes -> reglages independants.
+void TCC1_Handler()
+{
+  // On verifie que l'interruption vient bien de l'overflow (OVF)
+  if (TCC1->INTFLAG.bit.OVF)
+  {
+    TCC1->INTFLAG.bit.OVF = 1;   // Acquittement du flag (obligatoire, sinon l'IRQ reste active en boucle)
+
+    // --- Clignotement D5 (PWM 8 bits) ---
+    blink_D5_Counter++;
+    if (blink_D5_Counter >= BLINK_D5_OVERFLOW_COUNT)
+    {
+      blink_D5_Counter = 0;
+      led_D5_State = !led_D5_State;
+      REG_TCC1_CC1 = led_D5_State ? LED_D5_DUTY : 0;
+      // Pas besoin d'attendre SYNCBUSY ici : l'ecriture de CCx dans un handler
+      // d'interruption sur overflow est mise a jour au prochain cycle automatiquement
+      // via le registre de "double buffering" du TCC.
+    }
+
+    // --- Clignotement D8 (GPIO on/off, totalement independant de D5) ---
+    blink_D8_Counter++;
+    if (blink_D8_Counter >= BLINK_D8_OVERFLOW_COUNT)
+    {
+      blink_D8_Counter = 0;
+      led_D8_State = !led_D8_State;
+
+      if (led_D8_State)
+        PORT->Group[g_APinDescription[7].ulPort].OUTSET.reg = (1 << (g_APinDescription[7].ulPin % 32)); // D7 allumee
+      else
+        PORT->Group[g_APinDescription[7].ulPort].OUTCLR.reg = (1 << (g_APinDescription[7].ulPin % 32)); // D7 eteinte
+    }
+  }
+}
+*/
+
 
 
 void readSettings (void)
@@ -639,17 +940,17 @@ void readSettings (void)
   char x;
   char c = 'S';
   int y = 1;
-  int z = SQUARE;
+  int z = static_cast<int>(CovenWaves::Square);
 
   init_storage.read(x);
 
   if (x == 'S')  //S means eeprom has been initialized.
   {
     wave_storage.read(z);
-    waveSelects[0] = z;
-    waveSelects[1] = z;
-    waveSelects[2] = z;
-    waveSelects[3] = z;
+    waveSelects[0] = static_cast<CovenWaves>(z);
+    waveSelects[1] = static_cast<CovenWaves>(z);
+    waveSelects[2] = static_cast<CovenWaves>(z);
+    waveSelects[3] = static_cast<CovenWaves>(z);
     //wave_storage.read(waveSelects[1]);
     //wave_storage.read(waveSelects[2]);
     //wave_storage.read(waveSelects[3]);
@@ -663,10 +964,10 @@ void readSettings (void)
     div_storage.write(y);
     divSelect = 0;
     //waveSelect = 1;
-    waveSelects[0] = z;
-    waveSelects[1] = z;
-    waveSelects[2] = z;
-    waveSelects[3] = z;
+    waveSelects[0] = static_cast<CovenWaves>(z);
+    waveSelects[1] = static_cast<CovenWaves>(z);
+    waveSelects[2] = static_cast<CovenWaves>(z);
+    waveSelects[3] = static_cast<CovenWaves>(z);
   }
 }
 
@@ -677,9 +978,9 @@ void saveSettings (void)
 
   // only store the value if it's different from the previous stored value
   wave_storage.read(x);
-  if (x != waveSelects[0])
+  if (x != static_cast<int>(waveSelects[0]))
   {
-    x = waveSelects[0];
+    x = static_cast<int>(waveSelects[0]);
     wave_storage.write(x);  // <-- save the waveSelect 
   }
 
@@ -689,57 +990,26 @@ void saveSettings (void)
 }
 
 
-#define NUMREADINGS 50
-unsigned int pot[NUMREADINGS];
-unsigned int freq[NUMREADINGS];
 
-void filterPut (char input, unsigned int newreading)
-{
-  static unsigned char potptr = 0;
-  static unsigned char freqptr = 0;
-
-  if (input == POT)
-  {
-    pot[potptr] = newreading;
-    potptr++;
-    if (potptr >= NUMREADINGS)
-      potptr=0;
+uint16_t euclidean_gcd(uint16_t a, uint16_t b) {
+  // really standard algorithm, found on https://www.cppbetterexplained.com/posts/cpp-gcd-lcm/
+  while (b != 0) {
+    uint16_t temp = b;
+    b = a % b;    // remainder becomes the new b
+    a = temp;     // old b becomes the new a
   }
-
-  else if (input == FREQ)
-  {
-    freq[freqptr] = newreading;
-    freqptr++;
-    if (freqptr >= NUMREADINGS)
-      freqptr = 0;
-  }
-  
+  return a;
 }
 
-unsigned int filterGet (bool input)
+uint16_t get_lcd(uint16_t A, uint16_t B, uint16_t C, uint16_t D)
 {
-  unsigned long int x;
-  float z;
-  unsigned char y;
-
-  x = 0;
-  if (input == POT)
-  {
-    for (y=0;y<NUMREADINGS;y++)
-    {
-      x = x + pot[y];
-    }
-  }
-  else if (input == FREQ)
-  {
-    for (y=0;y<NUMREADINGS;y++)
-    {
-      x = x + freq[y];
-    }
-  }
-
-  z = x;
-  z = z / NUMREADINGS;
-  z = z + 0.5;
-  return (unsigned int)z;
+  // apply the euclidean algorithm to calculate the least common divider
+  // useful to know when to sync relatively to the first wave, which is used as a ref
+  // relatively heavy on the computational side, but it's only applied when changing the
+  // divs, so this must not be common. It's essential that this function
+  // only gets called within the main loop.
+  uint16_t lcd_a_b = (A * B) / euclidean_gcd(A, B);
+  uint16_t lcd_c_d = (C * D) / euclidean_gcd(C, D);
+  return (lcd_a_b * lcd_c_d) / euclidean_gcd(lcd_a_b, lcd_c_d);
 }
+
