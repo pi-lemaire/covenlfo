@@ -7,36 +7,193 @@
 #include "antilog.h"
 #include "coven_defs.h"
 #include <Arduino.h>
+#include <array>
 
-
-// sync handling stuff
-#define SYNC_THESH_VALUE 370
 
 
 // phasor value for 1 hz given the 48 MHz PWM value / 9 bits
-#define HZPHASOR 91446
+constexpr uint32_t HZPHASOR = 91625;
 // original value : #define HZPHASOR 91183
 
 // the calculation is the following:
 // baseclock is 48 Mhz
-// TCC0 interrupts happen every 2x511 cycle of this master-clock
-// so the frequency of TCC0 is 46967 Hz
+// TCC0 interrupts happen every 2x512 cycle of this master-clock
+// so the frequency of TCC0 is 48000000/1024 = 46875 Hz
 // we want phasor to reach the long unsigned int overflow after one increment every TCC0 interrupt
-// long unsigned int max is 2^32-1 = 4294967295
-// so HZPhasor is 4294967295/46967 = 91446.49
+// long unsigned int max is 2^32-1 = 4294967295. It starts from 0 so it's actually 4294967296 values
+// so HZPhasor is 4294967296 / 46875 = 91625.97
+// we round to the lower value because it's probably better to have the clock lagging
+// back slightly behind the sync pulse when in sync
 
-
-volatile uint32_t accumulator1 = 0;
-volatile uint32_t accumulator2 = 0;
-volatile uint32_t accumulator3 = 0;
-volatile uint32_t accumulator4 = 0;
-volatile uint32_t phasor1;
-volatile uint32_t phasor2;
-volatile uint32_t phasor3;
-volatile uint32_t phasor4;
 
 // store the same random value for a whole period
 volatile uint16_t randNum[4];
+
+
+
+
+/*
+CovenSettings defaultPresets[] = {
+  CovenSettings(2.0f, {{
+    {1.0f, true, CovenWaves::Square}, {3.0f, true, CovenWaves::Square}, {5.0f, true, CovenWaves::Square}, {7.0f, true, CovenWaves::Square}
+  }}),
+  CovenSettings(4.0f, {{
+    {1.0f, true, CovenWaves::Triangle}, {2.0f, true, CovenWaves::Triangle}, {4.0f, true, CovenWaves::Triangle}, {8.0f, true, CovenWaves::Triangle}
+  }}),
+  CovenSettings(1.0f, {{
+    {1.0f, true, CovenWaves::Triangle}, {4.0f, true, CovenWaves::Triangle}, {8.0f, true, CovenWaves::Triangle}, {16.0f, true, CovenWaves::Triangle}
+  }})
+};
+*/
+
+// first 3 presets are identical to the original CovenLFO code (int dividers, base tempo identical to sync, triangle waves)
+// last one displays the added features:
+// for each LFO, we can set
+//   - the divider (can be a float), relative to the master clock (see below)
+//   - a flag (true|false) idicating whether we want the wave to be in sync with the master clock (see below). default=sync
+//     setting this flag to true means that the lfo divider sync is automatically truncated to an int (setting 0.7 value may result in s)
+//   - the wave used for this particular output (default = Triangle)
+//   - the master clock multiplier (end of the line, after the last } character) (default = 1)
+// to handle better syncs, we have added a master clock, which is calculated relative to the sync signal
+// this means that setting the master clock to x4 results in the main tempo being quarter notes relative to the sync signal
+// setting a high values also pushes the lfos further into audio territory
+
+
+CovenSettings defaultPresets[] = {
+  CovenSettings({{ {1}, {3}, {5}, {7} }}),
+  CovenSettings({{ {1}, {2}, {4}, {8} }}),
+  CovenSettings({{ {1}, {4}, {8}, {16} }}),
+  CovenSettings({{ {1, true, CovenWaves::Square}, {3, true, CovenWaves::RampDown}, {12.5f, false, CovenWaves::Random}, {19.2f, false, CovenWaves::Triangle} }}, 4.0f)
+};
+
+CovenPresets<sizeof(defaultPresets) / sizeof(defaultPresets[0])> Presets(defaultPresets);      // N est déduit automatiquement (=3)
+
+
+
+
+
+
+// Class to handle and store the accumulators and phasers,
+// that MUST be updated with the best possible accuracy
+// This mechanism now also handles the sync
+// data is shared between the main loop and the ISR
+// the main loop sets the settings, the ISR doesn't need to access the other elements anymore
+
+class AccsAndPhasors {
+  public:
+    uint8_t increment()
+    {
+      uint8_t ret = 0x00;
+
+      bool resetAcc0 = false;
+
+      uint32_t prevAcc0 = acc0;
+      acc0 += phasor0;
+      if (acc0<prevAcc0)
+      {
+        // we just overflowed, the divided clock is reset
+        resetAcc0 = true;
+        ++count0;
+      }
+
+      
+      for (uint8_t i=0; i<4; ++i)
+      {
+        uint32_t prevAcc = accumulator[i];
+        accumulator[i] += phasor[i];
+
+        if (doReset[i] && resetAcc0)
+        {
+          // the master clock has been reset
+          ++count[i];
+        }
+        if (accumulator[i]<prevAcc)
+          // this also handles the case of unsync oscillators
+          ret |= 0x01 << i;
+      }
+      
+      return ret;
+    }
+
+    uint32_t getAccValue(uint8_t ind, bool mainAcc=false) const
+    {
+      uint32_t ret;
+      if (mainAcc)
+        ret = acc0;
+      else
+        ret = accumulator[ind];
+      return ret;
+    }
+
+    void setPhasor(uint8_t ind, uint32_t value, bool mainAcc=false)
+    {
+      //noInterrupts();
+      if (mainAcc)
+      {
+        phasor0 = value;
+        //interrupts();
+        return;
+      }
+        
+      // set the value of the corresponding phaser
+      phasor[ind] = value;
+      //interrupts();
+    }
+
+    void setResetInfo(uint8_t ind, uint16_t div, bool do_reset)
+    {
+      // noInterrupts();
+      resetEvery[ind] = div;
+      doReset[ind] = do_reset;
+      // interrupts();
+    }
+
+    void reSync(uint8_t ind, bool mainAcc=false)
+    {
+      if (mainAcc)
+      {
+        acc0 = 0;
+        count0 = 0;
+        return;
+      }
+
+      // simply reset the accumulator and the counter
+      accumulator[ind] = 0;
+      count[ind] = 0;
+    }
+
+    void reSyncAll()
+    {
+      acc0 = 0;
+      count0 = 0;
+      for (uint8_t i=0; i<4; ++i)
+      {
+        accumulator[i] = 0;
+        count[i] = 0;
+      }
+    }
+
+  private:
+    // i've added count0 to be used as some sort of a master clock resetter.
+    // for now, it's not used, but resets based on the lcd may be useful because there's currently
+    // no way of resyncing the clocks if they ever desynchronized other than changing the div
+    // No waveform is going to be calculated on this one
+    volatile uint32_t acc0 = 0;
+    volatile uint32_t phasor0 = 91625;
+    volatile uint16_t count0 = 0;
+    volatile uint32_t accumulator[4] = {0, 0, 0, 0}; // volatile for the accumulators is probably not useful
+    volatile uint32_t phasor[4] = {91625, 91625/2, 91625/4, 91625/8};  
+    volatile uint16_t count[4] = {0, 0, 0, 0};
+    volatile uint16_t resetEvery[4] = {1, 2, 4, 8};
+    volatile bool doReset[4] = {true, true, true, true};  // may be replaced by flags
+};
+
+AccsAndPhasors accumulators;
+
+
+
+
+
 
 // the flash storage handler will need to be updated at some point
 FlashStorage(div_storage, int);
@@ -51,6 +208,8 @@ FlashStorage(init_storage, char);
 
 // classic mode definitions
 
+
+/*
 constexpr uint8_t DIVSIZE = 3;
 
 char divs[DIVSIZE][4]={ {1,3,7,11},
@@ -59,7 +218,7 @@ char divs[DIVSIZE][4]={ {1,3,7,11},
 
 
 CovenWaves waveSelects[4] = { CovenWaves::Square, CovenWaves::Square, CovenWaves::Square, CovenWaves::Square };
-
+*/
 
 ////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////
@@ -190,8 +349,18 @@ ButtonState getButtonState(void)
 ///////////////////////////////////////////////////////////
 
 
+// what threshold we use to compare to when using analogread()
+constexpr uint16_t SYNC_THESH_VALUE = 370;
+
 // number of sync verifications before deciding that it's possible that we leave the sync mode
-constexpr uint8_t SYNCDUMMYCHECKS = 100;
+constexpr uint8_t SYNC_DUMMY_CHECKS = 100;
+
+// max allowed time in microseconds before we stop tracking the pulses and interprete the next
+// pulse as a new train of triggers (basically, the minimum frequency allowed)
+constexpr uint32_t SYNC_MAX_TIME = 4 * 1000000;
+
+// TODO: implement this
+
 
 
 // now the general sync handling is performed through an object
@@ -286,7 +455,7 @@ public:
       knownPotValue = potValue;
       checksCounter++;
     }
-    else if (checksCounter<SYNCDUMMYCHECKS)
+    else if (checksCounter<SYNC_DUMMY_CHECKS)
       checksCounter++;
     else
     {
@@ -307,9 +476,9 @@ public:
   {
     // avoid corrupted returns since period is a multi-byte value
     // susceptible of being shared and modify between main loop and ISR
-    noInterrupts();
+    // noInterrupts();
     uint32_t p = period;
-    interrupts();
+    // interrupts();
     return p;
   }
 
@@ -346,48 +515,6 @@ SyncHandler sync;
 
 
 
-// handle a CV input: accumulate values, and provide their mean value
-// this is a direct replacement of the former filterPut and filterGet functions
-
-constexpr uint8_t CVBitWiseTableSize = 5;                   // 2^5=32 is going to be the table size. If you want more filtering, you may
-                                                            // try with 6 instead (filter on the 64 last read values)
-constexpr uint8_t CVTableSize = 0x01 << CVBitWiseTableSize; // 32 - The point is to avoid a time-consuming division by replacing it with a shift
-
-class CVInHandler {
-public:
-  explicit CVInHandler(uint8_t pin) : pin_to_read(pin)
-  {
-    for (uint8_t i = 0; i < CVTableSize; ++i)
-      cv_readings[i] = 0;
-  }
-
-  uint16_t readCV()
-  {
-    // the basic idea is to always have the sum stored, and just modify it by replacing the
-    // oldest value by the newer one, like in a fifo pile
-    // if the table size is power of 2, division is just a shift register, which is much faster
-    int16_t new_value = analogRead(pin_to_read);
-    summed_values -= cv_readings[cursor];
-    summed_values += new_value;
-
-    cv_readings[cursor] = new_value;
-
-    cursor = (cursor + 1) & (CVTableSize - 1); // equivalent to %CVTableSize in this context
-
-    return (summed_values >> CVBitWiseTableSize);
-  }
-
-  private:
-    uint8_t cursor = 0;
-    uint8_t pin_to_read;
-    int32_t summed_values = 0;
-    int16_t cv_readings[CVTableSize];
-};
-
-
-
-
-
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++ MAIN LOOP +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -400,9 +527,11 @@ void loop()
   // check if we want to 
   unsigned long lastSettingsSave = 0;
 
-
-  static CVInHandler PotReader(A0);
-  static CVInHandler FreqReader(A4);
+  // the template value <5> is used to smoothe the read values on 2^5=32 values
+  // if you want more smoothing, use 6 or 7 (the max). Conversely, less is possible.
+  // original CovenLFO version was 50 values, so between 5 and 6
+  static CVInHandler<5> PotReader(A0);
+  static CVInHandler<5> FreqReader(A4);
 
   
   // evaluate the sync status
@@ -422,53 +551,17 @@ void loop()
 
     if (syncCount == 0)  //first time sync, clear all accs so waveform starts at 0 and begins synced
     {
-      accumulator1=0;
-      accumulator2=0;  
-      accumulator3=0;
-      accumulator4=0;
+      accumulators.reSyncAll();
     }
-    else
-    {
-      // store reset values because accumulator values may be changed by an interrupt before the end of the block
-      bool rst_1=false, rst_2=false, rst_3=false, rst_4=false;
-      if (syncCount % divs[divSelect][0] == 0)
-      {
-        // div 1
-        accumulator1 = 0;
-        rst_1 = true;
-      }
-      if (syncCount % divs[divSelect][1] == 0)
-      {
-        // div 2
-        accumulator2 = 0;
-        rst_2 = true;
-      }
-      if (syncCount % divs[divSelect][2] == 0)
-      {
-        // div 3
-        accumulator3 = 0;
-        rst_3 = true;
-      }
-      if (syncCount % divs[divSelect][3] == 0)
-      {
-        // div 4
-        accumulator4 = 0;
-        rst_4 = true;
-      }
-
-      if (rst_1 && rst_2 && rst_3 && rst_4)
-        // avoid accumulating values into syncCount and getting an overflow (I suppose)
-        sync.resetSyncCounter();
-      else
-        sync.incSyncCounter();
-    }
+    // probably perform it rather in the sync itself systematically, but for now it's in the main loop
+    sync.incSyncCounter();
   }
 
   
-////////////////////////////////////////////////////////////////////////////////////
-//       "EEPROM" Save                                                            //
-//       Store the settings after 60 seconds                                      //
-////////////////////////////////////////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////
+  //       "EEPROM" Save                                //
+  //       Store the settings after 60 seconds          //
+  ////////////////////////////////////////////////////////
   if ((millis() - (lastSettingsSave)) > (60000))
   {
     saveSettings();
@@ -488,47 +581,55 @@ void loop()
   // act accordingly
   if (currentButtonState == ButtonState::Short_Press)
   {
+    // circulate through the waves
     if (interfaceMode == CovenAlgo::Classic)
     {
       // if in classic mode: change all the waves altogether to match the first one
-      CovenWaves newWaveSelect = waveSelects[0];  // wave shapes are numbered starting from 1, the typical (var + 1) % number_vals works when starting with 0
-      ++newWaveSelect;
 
-      // apply to all the waves
-      waveSelects[0] = newWaveSelect;
-      waveSelects[1] = newWaveSelect;
-      waveSelects[2] = newWaveSelect;
-      waveSelects[3] = newWaveSelect;
+      // we have to copy the value because the ++ operator is not compatible with volatile values
+      CovenWaves currW = Presets.curr()[0].wave;
+      ++currW;
+
+      for (uint8_t i=0; i<4; ++i)
+      {
+        // stupid copy is to handle the volatile thing
+        // wonder if it's actually useful to declare this as volatile???
+        //CovenWaves currW = Presets.curr()[i].wave;
+        Presets.curr()[i].wave = currW;
+      }
     }
     else if ((interfaceMode == CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
     {
-      // only change the selected wave 
-      ++(waveSelects[selectedWave]); // = (waveSelects[selectedWave] % WAVES_NUMBER) + 1;
+      // probably a good idea to add a class method for incrementing a specific wave instead of this
+      CovenWaves currW = Presets.curr()[selectedWave].wave;
+      Presets.curr()[selectedWave].wave = ++currW;
     }
   }
   else if (currentButtonState == ButtonState::Medium_Press)
   {
     // medium time press and release to change divisions
     if (interfaceMode == CovenAlgo::Classic)
-    {
-      accumulator1=0; 
-      accumulator2=0; 
-      accumulator3=0; 
-      accumulator4=0;
-      phasor1 = 0;
-      phasor2 = 0;
-      phasor3 = 0;
-      phasor4 = 0;
-      
+    {      
       // pausing to show that something has happened
-      delay(800);
+      delay(400);
       // TODO : replace this delay by some additional led display
-      
-      divSelect = (divSelect + 1) % DIVSIZE;
+
+      Presets.next();
+
+      // update the divider and sync infos for the accumulators
+      noInterrupts();
+      // forbidding the interrupts prevents a cycle with divs coming from different settings from happening
+      for (uint8_t i=0; i<4; ++i)
+      {
+        accumulators.setResetInfo(i, static_cast<uint16_t>(Presets.curr()[i].divider * Presets.curr().div), Presets.curr()[i].synced);
+      }
+      accumulators.reSyncAll();
+      interrupts();
+        
     }
     else if ((interfaceMode==CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
     {
-      // just change the selected wave
+      // just change the selected output
       selectedWave = (selectedWave + 1) % 4;
 
       // now what we need to do is add the manual mode to the pot handling to change the divisions or stuff like that
@@ -563,8 +664,7 @@ void loop()
   static int oldpotValue; 
 
   // read the potentiometer value
-  // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
-  //filterPut(POT, analogRead(A0));
+  // the value is smoothed with PotReader
   potValue = PotReader.readCV(); //filterGet(POT);
 
 
@@ -577,7 +677,6 @@ void loop()
   //              UPDATE THE PHASER INCREMENTS              //
   ////////////////////////////////////////////////////////////
 
-  //if (ClockMode == CovenClockMode::Sync)
   if (sync.isActive())
   {
     //better way to update sweepvalue with sync frequency
@@ -589,7 +688,6 @@ void loop()
 
     // read the freq cv value (useless when in sync mode)
     // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
-    //filterPut(FREQ, analogRead(A4));
     cv1Value = FreqReader.readCV(); //filterGet(FREQ);
     
     // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
@@ -599,6 +697,7 @@ void loop()
     cv1Value = cv1Value - 512;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
     //cv1Value = cv1Value - 565;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
     
+    //cv1Value = 0;
 
     // the device is self-clocked
     if ( (cv1Value > 20) || (cv1Value < -20) ) 
@@ -618,16 +717,18 @@ void loop()
   }
 
   // testing the value of HZPHASOR, we force the main clock to be 1 Hz
-  // sweepValue = 440;
+  //sweepValue = 1;
 
   // tempphasor is the fastest increment according to the general clock
-  tempphasor = sweepValue * HZPHASOR;
+  tempphasor = sweepValue * HZPHASOR * Presets.curr().div;
 
-  // update the individual values with their corresponding dividers
-  phasor1 = (unsigned long int) (tempphasor / divs[divSelect][0]);
-  phasor2 = (unsigned long int) (tempphasor / divs[divSelect][1]); // dividing down for the slower outputs 
-  phasor3 = (unsigned long int) (tempphasor / divs[divSelect][2]);
-  phasor4 = (unsigned long int) (tempphasor / divs[divSelect][3]);
+  // update the base clock
+  accumulators.setPhasor(5, (unsigned long int) tempphasor, true);
+
+  // update the individual phasers.
+  for (uint8_t i=0; i<4; ++i)
+    accumulators.setPhasor(i, (unsigned long int) (tempphasor / Presets.curr()[i].divider));
+
 }
 
 
@@ -637,33 +738,22 @@ void loop()
 
 // +++++++++++++++++++++++++++++++++++++++++ FUNCTION DEFINITIONS ++++++++++++++++++++++++++++++++++
 
-// previous_acc is used to store the last known acc value
-// it's useful to know when we start a new cycle, for the random steps generation
-unsigned long int previous_acc[4];
-// constexpr uint16_t HALFPOINT = 255;
-// constexpr uint16_t MAXPOINT = 511;
+// generate a waveform based on its accumulator value
+// acc is the accumulator value
+// waveshape is the waveshape
+// channel is the channel, between 0 and 3
+// and justCycled indicates whether this wave just cycled (acc<prevAcc)
+// it's computed externally in the accumulators object
 
-uint16_t generator(unsigned long int acc, CovenWaves waveshape, uint8_t channel, bool& justCycled)
+uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool justCycled)
 {
-  //December 12 - Adjusted for 9 bit
-  //unsigned char shifted_acc = acc>>24;
+  // to know when we're at the middle of the waveform  
+  constexpr uint16_t HALFPOINT = 255;
+  constexpr uint16_t MAXPOINT = 511;
   
   // unsigned long int is using 32 bits
   // so we keep the 9 outmost bits and base our calculation on those
-  
-  constexpr uint16_t HALFPOINT = 255;
-  constexpr uint16_t MAXPOINT = 511;
-
-  //unsigned int shifted_acc = acc>>23;
   uint16_t shifted_acc = static_cast<uint16_t>(acc>>23);
-
-  // store the prev_acc now so that we can update previous_acc.
-  // This is useful for the sync flag
-  unsigned long int prev_acc = previous_acc[channel];
-  previous_acc[channel] = shifted_acc;
-
-  // inform the parent caller that we just cycled through this wave
-  justCycled = (shifted_acc < prev_acc);
 
   switch(waveshape)
   {
@@ -690,15 +780,17 @@ uint16_t generator(unsigned long int acc, CovenWaves waveshape, uint8_t channel,
       }
       else //greater than HALFPOINT
       {
-        return ((MAXPOINT + 1 - shifted_acc) << 1); // +1 because if shifted_acc==MAXPOINT, we shift 0 and end up with an undesired value
+        return ((MAXPOINT + 1 - shifted_acc) << 1); 
+        // +1 because if shifted_acc==MAXPOINT, we shift 0 and end up with an undesired value
       }
     
     case CovenWaves::Random:
-      if (shifted_acc < prev_acc)
+      if (justCycled)
       // Do this so we only update when we cycle around the accumulator
       {
         // this is probably quite wrong regarding the timing needed to compute a random() in an interrupt
         // TODO : change this behaviour by generating random numbers in the main loop and just retrieving the value here
+        // randNum may probably be store as static????
         randNum[channel] = random(MAXPOINT);      
       }
 
@@ -818,7 +910,7 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3 (TCC0) + D5 (TCC1,
   TCC0->INTENSET.reg = 0;
   TCC0->INTENSET.bit.CNT = 1;  //*****************************************************
   //TCC0->INTENSET.bit.OVF = 1;  //*****************************************************
-  //TCC0->INTENSET.bit.MC0 = 0;
+  TCC0->INTENSET.bit.MC0 = 0;
 
   NVIC_EnableIRQ(TCC0_IRQn);
   NVIC_SetPriority(TCC0_IRQn, 0);   // High priority (0 = highest)
@@ -864,29 +956,18 @@ void setupTimers() // used to set up fast PWM on pins 1,9,2,3 (TCC0) + D5 (TCC1,
 void TCC0_Handler() 
 {
   if (TCC0->INTFLAG.bit.CNT)
-  //if (TCC0->INTFLAG.bit.OVF)
   {
-    //*************************************************
-    accumulator1 = accumulator1 + phasor1;
-    accumulator2 = accumulator2 + phasor2;
-    accumulator3 = accumulator3 + phasor3;
-    accumulator4 = accumulator4 + phasor4;
-    // delayMicroseconds(6);
+    // increment the accumulators and get the reset flags
+    uint8_t rst_flags = accumulators.increment();
 
-    // the cycle/reset calculation should happen here
-    // it can be driven
-    bool justCycled;
+    // calculate the waveforms and allocate them to the right outputs
+    REG_TCC0_CC0 = generator(accumulators.getAccValue(0), Presets.curr()[0].wave, 0, (rst_flags & 0b00000001));
+    REG_TCC0_CC2 = generator(accumulators.getAccValue(1), Presets.curr()[1].wave, 1, (rst_flags & 0b00000010));
+    REG_TCC0_CC3 = generator(accumulators.getAccValue(2), Presets.curr()[2].wave, 2, (rst_flags & 0b00000100));
+    REG_TCC0_CC1 = generator(accumulators.getAccValue(3), Presets.curr()[3].wave, 3, (rst_flags & 0b00001000));
 
-
-    REG_TCC0_CC0 = generator(accumulator1, waveSelects[0], 0, justCycled); // pin 9 //#4
-    // if there's some sort of sync to perform between the first wave and the other,
-    // just do it here.
-    REG_TCC0_CC2 = generator(accumulator2, waveSelects[1], 1, justCycled); // pin 1 //#2  
-    REG_TCC0_CC3 = generator(accumulator3, waveSelects[2], 2, justCycled); // pin 3 //#3
-    REG_TCC0_CC1 = generator(accumulator4, waveSelects[3], 3, justCycled); // pin 2 //#1
-
+    // reset the interruption flag
     TCC0->INTFLAG.bit.CNT = 1;
-    //TCC0->INTFLAG.bit.OVF = 1;
     //*******************************************************
   }
 }
@@ -947,10 +1028,14 @@ void readSettings (void)
   if (x == 'S')  //S means eeprom has been initialized.
   {
     wave_storage.read(z);
+    for (size_t i=0; i<4; i++)
+      Presets.curr()[i].wave = static_cast<CovenWaves>(z);
+    /*
     waveSelects[0] = static_cast<CovenWaves>(z);
     waveSelects[1] = static_cast<CovenWaves>(z);
     waveSelects[2] = static_cast<CovenWaves>(z);
     waveSelects[3] = static_cast<CovenWaves>(z);
+    */
     //wave_storage.read(waveSelects[1]);
     //wave_storage.read(waveSelects[2]);
     //wave_storage.read(waveSelects[3]);
@@ -964,10 +1049,21 @@ void readSettings (void)
     div_storage.write(y);
     divSelect = 0;
     //waveSelect = 1;
+    
+    for (size_t i=0; i<4; i++)
+      Presets.curr()[i].wave = static_cast<CovenWaves>(z);
+    /*
     waveSelects[0] = static_cast<CovenWaves>(z);
     waveSelects[1] = static_cast<CovenWaves>(z);
     waveSelects[2] = static_cast<CovenWaves>(z);
     waveSelects[3] = static_cast<CovenWaves>(z);
+    */
+
+    for (uint8_t i=0; i<4; ++i)
+    {
+      accumulators.setResetInfo(i, static_cast<uint16_t>(Presets.curr()[i].divider * Presets.curr().div), Presets.curr()[i].synced);
+    }
+
   }
 }
 
@@ -978,38 +1074,14 @@ void saveSettings (void)
 
   // only store the value if it's different from the previous stored value
   wave_storage.read(x);
-  if (x != static_cast<int>(waveSelects[0]))
+  if (x != static_cast<int>(Presets.curr()[0].wave))
   {
-    x = static_cast<int>(waveSelects[0]);
+    x = static_cast<int>(Presets.curr()[0].wave);
     wave_storage.write(x);  // <-- save the waveSelect 
   }
 
   div_storage.read(x);
   if (x != divSelect)
     div_storage.write(divSelect);  // <-- save the divSelect  
-}
-
-
-
-uint16_t euclidean_gcd(uint16_t a, uint16_t b) {
-  // really standard algorithm, found on https://www.cppbetterexplained.com/posts/cpp-gcd-lcm/
-  while (b != 0) {
-    uint16_t temp = b;
-    b = a % b;    // remainder becomes the new b
-    a = temp;     // old b becomes the new a
-  }
-  return a;
-}
-
-uint16_t get_lcd(uint16_t A, uint16_t B, uint16_t C, uint16_t D)
-{
-  // apply the euclidean algorithm to calculate the least common divider
-  // useful to know when to sync relatively to the first wave, which is used as a ref
-  // relatively heavy on the computational side, but it's only applied when changing the
-  // divs, so this must not be common. It's essential that this function
-  // only gets called within the main loop.
-  uint16_t lcd_a_b = (A * B) / euclidean_gcd(A, B);
-  uint16_t lcd_c_d = (C * D) / euclidean_gcd(C, D);
-  return (lcd_a_b * lcd_c_d) / euclidean_gcd(lcd_a_b, lcd_c_d);
 }
 
