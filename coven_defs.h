@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <avr/pgmspace.h>
 #include <Arduino.h>
+#include <FlashAsEEPROM_SAMD.h>
 #include <array>
 
 
@@ -88,15 +89,13 @@ enum class SyncState: uint8_t {
 
 
 
-
-
-
 // Struct to store a single LFO settings. We switch to floats, that
 // will be rounded (truncated actually) when synced is true
 struct SingleLFOSettings {
   float divider;
   bool synced = true;
-  volatile CovenWaves wave = CovenWaves::Triangle;
+  //volatile CovenWaves wave = CovenWaves::Triangle;
+  CovenWaves wave = CovenWaves::Triangle;
 };
 
 
@@ -113,6 +112,11 @@ public:
 
 private:
     std::array<SingleLFOSettings,4> lfos;
+};
+
+
+struct SettingsHeader {
+    uint32_t magic = 0x43574D31;   // "CVM1"
 };
 
 
@@ -137,6 +141,52 @@ public:
 
     size_t getPos() const { return cursor; }
       // current settings position
+
+    void save()
+    {
+        int addr = 0;
+
+        SettingsHeader h;
+        EEPROM.put(addr, h);
+        addr += sizeof(h);
+
+        EEPROM.put(addr, cursor);
+        addr += sizeof(cursor);
+
+        for (size_t i = 0; i < N; i++)
+        {
+            EEPROM.put(addr, presets[i]);
+            addr += sizeof(CovenSettings);
+        }
+
+        EEPROM.commit();
+    }
+
+    bool load()
+    {
+        int addr = 0;
+
+        SettingsHeader h;
+        EEPROM.get(addr, h);
+
+        if (h.magic != 0x43574D31)
+            return false;          // première mise sous tension ou format différent
+
+        addr += sizeof(h);
+
+        // Restauration du curseur
+        EEPROM.get(addr, cursor);
+        addr += sizeof(cursor);
+
+        for (size_t i = 0; i < N; i++)
+        {
+            EEPROM.get(addr, presets[i]);
+            addr += sizeof(CovenSettings);
+        }
+
+        return true;
+    }
+
 
 private:
     CovenSettings (&presets)[N];  // automatically sets the number of settings
@@ -185,6 +235,50 @@ private:
     uint8_t cursor = 0;
     uint32_t summed_values = 0;
     uint16_t cv_readings[TableSize];
+};
+
+
+
+// Class to store the settings banks. The template things allows us to
+// store automatically the bank size upon object declaration
+template <size_t N>
+class CovenDice {
+public:
+    CovenDice(uint16_t max) : max_value(max)
+    {
+        for (size_t i=0; i<N; i++)
+        {
+            rd_values[i] = random(max);
+            used_values[i] = false;
+        }
+        read_cursor = 0;
+        write_cursor = 0;
+    }
+
+    void draw()
+    {
+        if (used_values[write_cursor])
+        {
+            rd_values[write_cursor] = random(max_value);
+            used_values[write_cursor] = false;
+            write_cursor = (write_cursor + 1) % N;
+        }
+    }
+
+    uint16_t get_value()
+    {
+        uint16_t ret_value = rd_values[read_cursor];
+        used_values[read_cursor] = true;
+        read_cursor = (read_cursor + 1) % N;
+        return ret_value;
+    }
+
+private:
+    uint16_t max_value;
+    size_t write_cursor = 0;
+    uint16_t rd_values[N];
+    volatile bool used_values[N];
+    volatile size_t read_cursor = 0;
 };
 
 

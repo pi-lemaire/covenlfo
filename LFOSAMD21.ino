@@ -26,25 +26,6 @@ constexpr uint32_t HZPHASOR = 91625;
 // back slightly behind the sync pulse when in sync
 
 
-// store the same random value for a whole period
-volatile uint16_t randNum[4];
-
-
-
-
-/*
-CovenSettings defaultPresets[] = {
-  CovenSettings(2.0f, {{
-    {1.0f, true, CovenWaves::Square}, {3.0f, true, CovenWaves::Square}, {5.0f, true, CovenWaves::Square}, {7.0f, true, CovenWaves::Square}
-  }}),
-  CovenSettings(4.0f, {{
-    {1.0f, true, CovenWaves::Triangle}, {2.0f, true, CovenWaves::Triangle}, {4.0f, true, CovenWaves::Triangle}, {8.0f, true, CovenWaves::Triangle}
-  }}),
-  CovenSettings(1.0f, {{
-    {1.0f, true, CovenWaves::Triangle}, {4.0f, true, CovenWaves::Triangle}, {8.0f, true, CovenWaves::Triangle}, {16.0f, true, CovenWaves::Triangle}
-  }})
-};
-*/
 
 // first 3 presets are identical to the original CovenLFO code (int dividers, base tempo identical to sync, triangle waves)
 // last one displays the added features:
@@ -231,6 +212,11 @@ int divSelect = 0;
 float sweepValue;
 volatile float syncFrequency = 1.; 
 
+
+// draw 8 random values on 9 bits
+CovenDice<8> Dice((0x01<<9)-1);
+
+
 // not sure those ar really useful
 void timerIsr();
 void setupTimers();
@@ -242,6 +228,7 @@ void TCC0_Handler();
 // +++++++++++++++++++++++++++++++++++ SETUP ++++++++++++++++++++++++++++++++++++++++
 void setup()
 {
+  //EEPROM.begin();
   pinMode(1, OUTPUT);
   pinMode(9, OUTPUT);
   pinMode(2, OUTPUT);
@@ -250,8 +237,12 @@ void setup()
   pinMode(6, INPUT_PULLUP); // pin 7 pushbutton to select waveform
   //pinMode(A10, INPUT); //used for analogReading sync (cv2) 
   pinMode(10, INPUT); //used for analogReading sync (cv2) 
-  readSettings();
+  // readSettings();
   randomSeed(analogRead(A8));
+
+  if (!Presets.load())
+    Presets.save();
+
   //Serial.begin(9600);
   setupTimers(); //  **this may not be the right location
   //randomSeed(analogRead(A8));
@@ -525,7 +516,7 @@ void loop()
   static int selectedWave = 0;
 
   // check if we want to 
-  unsigned long lastSettingsSave = 0;
+  unsigned long lastSettingsSave = millis();
 
   // the template value <5> is used to smoothe the read values on 2^5=32 values
   // if you want more smoothing, use 6 or 7 (the max). Conversely, less is possible.
@@ -562,9 +553,10 @@ void loop()
   //       "EEPROM" Save                                //
   //       Store the settings after 60 seconds          //
   ////////////////////////////////////////////////////////
-  if ((millis() - (lastSettingsSave)) > (60000))
+  if ((millis() - (lastSettingsSave)) > (5000))
   {
-    saveSettings();
+    Presets.save();
+    // saveSettings();
     lastSettingsSave = millis();
   }
   
@@ -601,8 +593,8 @@ void loop()
     else if ((interfaceMode == CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
     {
       // probably a good idea to add a class method for incrementing a specific wave instead of this
-      CovenWaves currW = Presets.curr()[selectedWave].wave;
-      Presets.curr()[selectedWave].wave = ++currW;
+      //CovenWaves currW = Presets.curr()[selectedWave].wave;
+      ++Presets.curr()[selectedWave].wave; // = ++currW;
     }
   }
   else if (currentButtonState == ButtonState::Medium_Press)
@@ -729,6 +721,10 @@ void loop()
   for (uint8_t i=0; i<4; ++i)
     accumulators.setPhasor(i, (unsigned long int) (tempphasor / Presets.curr()[i].divider));
 
+
+  // draw a random value
+  Dice.draw();
+
 }
 
 
@@ -750,6 +746,9 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
   // to know when we're at the middle of the waveform  
   constexpr uint16_t HALFPOINT = 255;
   constexpr uint16_t MAXPOINT = 511;
+
+  // store the random values for cycles
+  static uint16_t randNum[4];
   
   // unsigned long int is using 32 bits
   // so we keep the 9 outmost bits and base our calculation on those
@@ -791,7 +790,7 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
         // this is probably quite wrong regarding the timing needed to compute a random() in an interrupt
         // TODO : change this behaviour by generating random numbers in the main loop and just retrieving the value here
         // randNum may probably be store as static????
-        randNum[channel] = random(MAXPOINT);      
+        randNum[channel] = Dice.get_value(); //random(MAXPOINT);      
       }
 
       //previous_acc[channel] = shifted_acc;  
@@ -1015,7 +1014,7 @@ void TCC1_Handler()
 */
 
 
-
+/*
 void readSettings (void)
 {
   char x;
@@ -1030,12 +1029,6 @@ void readSettings (void)
     wave_storage.read(z);
     for (size_t i=0; i<4; i++)
       Presets.curr()[i].wave = static_cast<CovenWaves>(z);
-    /*
-    waveSelects[0] = static_cast<CovenWaves>(z);
-    waveSelects[1] = static_cast<CovenWaves>(z);
-    waveSelects[2] = static_cast<CovenWaves>(z);
-    waveSelects[3] = static_cast<CovenWaves>(z);
-    */
     //wave_storage.read(waveSelects[1]);
     //wave_storage.read(waveSelects[2]);
     //wave_storage.read(waveSelects[3]);
@@ -1052,12 +1045,6 @@ void readSettings (void)
     
     for (size_t i=0; i<4; i++)
       Presets.curr()[i].wave = static_cast<CovenWaves>(z);
-    /*
-    waveSelects[0] = static_cast<CovenWaves>(z);
-    waveSelects[1] = static_cast<CovenWaves>(z);
-    waveSelects[2] = static_cast<CovenWaves>(z);
-    waveSelects[3] = static_cast<CovenWaves>(z);
-    */
 
     for (uint8_t i=0; i<4; ++i)
     {
@@ -1084,4 +1071,4 @@ void saveSettings (void)
   if (x != divSelect)
     div_storage.write(divSelect);  // <-- save the divSelect  
 }
-
+*/
