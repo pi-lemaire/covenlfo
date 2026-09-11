@@ -4,7 +4,8 @@
 
 #include <FlashAsEEPROM_SAMD.h>
 #include <avr/pgmspace.h>
-#include "antilog.h"
+//#include "antilog.h"
+#include "coven_luts.h"
 #include "coven_defs.h"
 #include <Arduino.h>
 #include <array>
@@ -676,7 +677,11 @@ void loop()
   }
   else
   {
-    int totalcv = potValue;
+    float potFreq = pgm_read_float_near(hzcurve + potValue);
+
+    
+
+    // int totalcv = potValue;
 
     // read the freq cv value (useless when in sync mode)
     // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
@@ -686,11 +691,35 @@ void loop()
     // we center the value around 0
     
     cv1Value = 1023 - cv1Value; // so we want to invert it (making -12V correspond to 0V on the XIAO)
-    cv1Value = cv1Value - 512;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
+    //cv1Value = cv1Value - 512;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
     //cv1Value = cv1Value - 565;  //at this point cv1Value contains between -512 and +511 (this line used to center values around zero)
     
+    // float cv_multiplier = pgm_read_float_near(hzcurve + potValue);
+
+    constexpr uint8_t cv_scaler_bit_depth = 2;
+      // 1 bit of scaling is cv can affect main frequency from approx /2 to *2
+    
+    // cv value is encoded on 10 bits
+
+    // retrieve the floating part on 10 - cv_scaler_bit_depth bits
+    uint16_t cv_float_part_idx = cv1Value & ((0x01 << (10 - cv_scaler_bit_depth)) - 1);
+
+    // adjust so that we are effectively using the 9 bits of the LUT
+    cv_float_part_idx = cv_float_part_idx << (9 - (10 - cv_scaler_bit_depth));
+
+    // the integer part is this:
+    uint16_t cv_int_part = cv1Value >> (10 - cv_scaler_bit_depth);
+
+    // calculation will be 2^cv_int_part * lut(cv_float_part)
+
+    float cv_frac = pgm_read_float_near(pow2curve + cv_float_part_idx);
+
+    float cv_multiplier = ldexpf(cv_frac, (int) cv_int_part - cv_scaler_bit_depth);
+
+    sweepValue = cv_multiplier * potFreq;
     //cv1Value = 0;
 
+    /*
     // the device is self-clocked
     if ( (cv1Value > 20) || (cv1Value < -20) ) 
     {
@@ -706,6 +735,7 @@ void loop()
     // read the frequency value in the antilog.h table.
     // hzcurve is a lut table, so +totalcv provides the position in the table
     sweepValue = pgm_read_float_near(hzcurve + totalcv);
+    */
   }
 
   // testing the value of HZPHASOR, we force the main clock to be 1 Hz
@@ -752,12 +782,13 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
   
   // unsigned long int is using 32 bits
   // so we keep the 9 outmost bits and base our calculation on those
-  uint16_t shifted_acc = static_cast<uint16_t>(acc>>23);
+  uint16_t shifted_acc; // = static_cast<uint16_t>(acc>>23);
 
   switch(waveshape)
   {
     case CovenWaves::Square:
-      if (shifted_acc > HALFPOINT)
+      //if (shifted_acc > HALFPOINT)
+      if (acc & 0x01<<31) // the leftmost bit is 1
       {
         return MAXPOINT;
       }
@@ -767,21 +798,32 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
       }
 
     case CovenWaves::RampDown:
-      return shifted_acc;
+      // return shifted_acc;
+      return static_cast<uint16_t>(acc>>23);
 
     case CovenWaves::RampUp:
-      return MAXPOINT - shifted_acc;
+      // return MAXPOINT - shifted_acc;
+      return MAXPOINT - static_cast<uint16_t>(acc>>23);
 
     case CovenWaves::Triangle:
-      if (shifted_acc <= HALFPOINT)
+      // keep the precision here
+      shifted_acc = static_cast<uint16_t>(acc>>22);
+      //if (shifted_acc <= HALFPOINT)
+      if (shifted_acc <= MAXPOINT)
       {
-        return (shifted_acc<<1);
+        //return (shifted_acc<<1);
+        return shifted_acc;
       }
       else //greater than HALFPOINT
       {
-        return ((MAXPOINT + 1 - shifted_acc) << 1); 
+        return shifted_acc ^ (0x3FF); // XOR with 1023 is equivalent to 1023-shifted_acc
+        //return ((MAXPOINT + 1 - shifted_acc) << 1); 
         // +1 because if shifted_acc==MAXPOINT, we shift 0 and end up with an undesired value
       }
+
+    case CovenWaves::Sine:
+      shifted_acc = static_cast<uint16_t>(acc>>22);
+      return pgm_read_word_near(sin_curve + shifted_acc);
     
     case CovenWaves::Random:
       if (justCycled)
