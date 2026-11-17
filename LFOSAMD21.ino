@@ -42,9 +42,9 @@ constexpr uint32_t HZPHASOR = 91625;
 
 
 CovenSettings defaultPresets[] = {
-  CovenSettings({{ {1}, {3}, {5}, {7} }}),
-  CovenSettings({{ {1}, {2}, {4}, {8} }}),
-  CovenSettings({{ {1}, {4}, {8}, {16} }}),
+  CovenSettings({{ {1}, {16}, {48}, {80} }}, 16),
+  CovenSettings({{ {1}, {16}, {32}, {64} }}, 16),
+  CovenSettings({{ {1}, {8}, {32}, {128} }}, 8),
   CovenSettings({{ {1, true, CovenWaves::Square}, {3, true, CovenWaves::RampDown}, {12.5f, false, CovenWaves::Random}, {19.2f, false, CovenWaves::Triangle} }}, 4.0f)
 };
 
@@ -229,6 +229,30 @@ void TCC0_Handler();
 // +++++++++++++++++++++++++++++++++++ SETUP ++++++++++++++++++++++++++++++++++++++++
 void setup()
 {
+  // for debugging purposes - comment out when not necessary
+  /*
+  Serial.begin(115200);
+  while (!Serial) {}
+  */
+  if (!Presets.load())
+    Presets.save();
+
+
+  // Serial.print("div preset[0][0] BEFORE modification: ");
+  // Serial.println(Presets.curr()[0].divider);
+
+  // // Modifie une valeur bien identifiable
+  // Presets.curr()[0].divider = 42.0f;
+  // Presets.save();
+
+  // Serial.print("div preset[0][0] AFTER save: ");
+  // Serial.println(Presets.curr()[0].divider);
+
+  // Serial.println("---> Reset la carte maintenant et regarde si 42.00 persiste <---");
+  // if (!Presets.load())
+  //   Presets.save();
+
+
   //EEPROM.begin();
   pinMode(1, OUTPUT);
   pinMode(9, OUTPUT);
@@ -240,9 +264,6 @@ void setup()
   pinMode(10, INPUT); //used for analogReading sync (cv2) 
   // readSettings();
   randomSeed(analogRead(A8));
-
-  if (!Presets.load())
-    Presets.save();
 
   //Serial.begin(9600);
   setupTimers(); //  **this may not be the right location
@@ -506,24 +527,42 @@ SyncHandler sync;
 
 
 
+volatile uint32_t _debug_total_time_spent_in_TCC0 = 0;
+volatile uint32_t _debug_max_time_spent_in_TCC0 = 0;
+volatile uint32_t _debug_number_of_calls_to_TCC0 = 0;
+
+
+uint16_t min_pot_value = 0x01<<10;
+uint16_t max_pot_value = 0;
+
+uint16_t min_cv_value = 0x01<<10;
+uint16_t max_cv_value = 0;
+
+
 
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++ MAIN LOOP +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 void loop()
 {
+  static int loop_cycles = 0;
+
   // default values for the interface:
   static CovenAlgo interfaceMode = CovenAlgo::Classic;
   static int selectedWave = 0;
 
-  // check if we want to 
-  unsigned long lastSettingsSave = millis();
+  // set a clock timer to save the settings regularly
+  static unsigned long lastSettingsSave = millis();
+  static uint32_t time_since_last_debug_output = millis();
 
   // the template value <5> is used to smoothe the read values on 2^5=32 values
   // if you want more smoothing, use 6 or 7 (the max). Conversely, less is possible.
   // original CovenLFO version was 50 values, so between 5 and 6
-  static CVInHandler<5> PotReader(A0);
+  //static CVInHandler<6> PotReader(A0);
+  static CVInHandler_DualQuantile PotReader(A0);
   static CVInHandler<5> FreqReader(A4);
+
+
 
   
   // evaluate the sync status
@@ -660,6 +699,17 @@ void loop()
   // the value is smoothed with PotReader
   potValue = PotReader.readCV(); //filterGet(POT);
 
+  // if (PotReader.isLocked())
+  //   Serial.println("pot value locked");
+
+
+  // DEBUG STUFF
+  if (potValue < min_pot_value)
+    min_pot_value = potValue;
+  if (potValue > max_pot_value)
+    max_pot_value = potValue;
+  // END OF DEBUG STUFF
+
 
   if (sync.isActive())
     sync.checkSyncMode(potValue);
@@ -686,6 +736,13 @@ void loop()
     // read the freq cv value (useless when in sync mode)
     // the value is smoothed with filterPut (accumulates the readings) and filterGet (computes a mean)
     cv1Value = FreqReader.readCV(); //filterGet(FREQ);
+
+    // DEBUG STUFF
+    if (cv1Value < min_cv_value)
+      min_cv_value = cv1Value;
+    if (cv1Value > max_cv_value)
+      max_cv_value = cv1Value;
+    // END OF DEBUG STUFF
     
     // at this stage, a -12V CV corresponds to +3.3V (1023 as an analog read) on the XIAO (Because of the inverting op-amp)
     // we center the value around 0
@@ -755,6 +812,82 @@ void loop()
   // draw a random value
   Dice.draw();
 
+
+  static bool first_display = true;
+
+  
+  /*
+  // DEBUGGING DISPLAY STUFF
+  if (millis()-1000 > time_since_last_debug_output)
+  {
+    uint32_t record_time_since_last_debug_output = time_since_last_debug_output;
+    time_since_last_debug_output = millis();
+
+    record_time_since_last_debug_output = time_since_last_debug_output - record_time_since_last_debug_output;
+
+    noInterrupts();
+    // just gathering the data in copy to break the interrupt cycles as shortly as possible
+    uint32_t total_time_spent_in_TCC0_cpy = _debug_total_time_spent_in_TCC0;
+    _debug_total_time_spent_in_TCC0 = 0;
+    uint32_t max_time_spent_in_TCC0_cpy = _debug_max_time_spent_in_TCC0;
+    _debug_max_time_spent_in_TCC0 = 0;
+    uint32_t calls_to_TCC0_cpy = _debug_number_of_calls_to_TCC0;
+    _debug_number_of_calls_to_TCC0 = 0;
+    interrupts();
+    */
+  if (false)
+  {
+    if (first_display)
+    {
+      //Serial.println("interv,loops,TCC0_spent,TCC0_max,TCC0_calls,min_pot,max_pot,min_cv,max_cv");
+      Serial.println("time_ms,read,filtered,result,locked");
+      first_display = false;
+    }
+
+    /*
+    Serial.print(PotReader.lastReadingTime());
+    Serial.print(",");
+    Serial.print(PotReader.lastReadValue());
+    Serial.print(",");
+    Serial.print(PotReader.lastFilteredValue());
+    Serial.print(",");
+    Serial.print(potValue);
+    Serial.print(",");
+    Serial.println(PotReader.isLocked());
+    */
+
+    /*
+    Serial.print(record_time_since_last_debug_output);
+    Serial.print(",");
+    Serial.print(loop_cycles);
+    Serial.print(",");
+    Serial.print(total_time_spent_in_TCC0_cpy);
+    Serial.print(",");
+    Serial.print(max_time_spent_in_TCC0_cpy);
+    Serial.print(",");
+    Serial.print(calls_to_TCC0_cpy);
+    Serial.print(",");
+    Serial.print(min_pot_value);
+    Serial.print(",");
+    Serial.print(max_pot_value);
+    Serial.print(",");
+    Serial.print(min_cv_value);
+    Serial.print(",");
+    Serial.println(max_cv_value);
+
+    min_pot_value = 0x01<<10;
+    max_pot_value = 0;
+
+    min_cv_value = 0x01<<10;
+    max_cv_value = 0;
+
+    loop_cycles = 0;
+    */
+  }
+  // END OF DEBUGGING DISPLAY STUFF
+  
+
+  ++loop_cycles;
 }
 
 
@@ -998,6 +1131,9 @@ void TCC0_Handler()
 {
   if (TCC0->INTFLAG.bit.CNT)
   {
+    // just for debugging
+    uint32_t tcc0_start_time = micros();
+
     // increment the accumulators and get the reset flags
     uint8_t rst_flags = accumulators.increment();
 
@@ -1006,6 +1142,15 @@ void TCC0_Handler()
     REG_TCC0_CC2 = generator(accumulators.getAccValue(1), Presets.curr()[1].wave, 1, (rst_flags & 0b00000010));
     REG_TCC0_CC3 = generator(accumulators.getAccValue(2), Presets.curr()[2].wave, 2, (rst_flags & 0b00000100));
     REG_TCC0_CC1 = generator(accumulators.getAccValue(3), Presets.curr()[3].wave, 3, (rst_flags & 0b00001000));
+
+    // DEBUG STUFF
+    uint32_t time_spent = micros() - tcc0_start_time;
+
+    _debug_total_time_spent_in_TCC0 += time_spent;
+    if (time_spent>_debug_max_time_spent_in_TCC0)
+      _debug_max_time_spent_in_TCC0 = time_spent;
+    ++_debug_number_of_calls_to_TCC0;
+    // END OF DEBUG STUFF
 
     // reset the interruption flag
     TCC0->INTFLAG.bit.CNT = 1;

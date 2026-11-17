@@ -96,7 +96,7 @@ struct SingleLFOSettings {
   float divider;
   bool synced = true;
   //volatile CovenWaves wave = CovenWaves::Triangle;
-  CovenWaves wave = CovenWaves::Triangle;
+  CovenWaves wave = CovenWaves::Square;
 };
 
 
@@ -116,8 +116,10 @@ private:
 };
 
 
+constexpr uint32_t magic_value = 0x43574D33;
+
 struct SettingsHeader {
-    uint32_t magic = 0x43574D31;   // "CVM1"
+    uint32_t magic = magic_value;   // "CVM1"
 };
 
 
@@ -170,7 +172,7 @@ public:
         SettingsHeader h;
         EEPROM.get(addr, h);
 
-        if (h.magic != 0x43574D31)
+        if (h.magic != magic_value)
             return false;          // première mise sous tension ou format différent
 
         addr += sizeof(h);
@@ -198,6 +200,13 @@ private:
 
 
 
+constexpr uint32_t CVInHandler_lock_time = 8000;    // time in millisec during which the CV must be stable to decide that it locks
+constexpr int16_t CVInHandler_lock_threshold = 4;   // the value has to be within +- this value to stay in lock
+                                                    // overall we have noticed that the value stays within a range of 8 values
+                                                    // stability is not the same over the full range of values
+                                                    // so the goal is to find the right center spot and then lock here
+
+
 template <uint8_t NBits>
 class CVInHandler {
     static_assert(NBits < 8, "TableSize must fit in a uint8_t cursor.");
@@ -210,6 +219,9 @@ public:
     {
         uint16_t new_value = analogRead(pin_to_read);
 
+        last_read_value = new_value;
+        last_reading_time = millis();
+
         if (!isInitialized)
         {
             for (uint8_t i = 0; i < TableSize; ++i)
@@ -218,6 +230,15 @@ public:
                 summed_values += new_value;
             }
             isInitialized = true;
+
+            is_locked = false;
+            last_known_outside_value = new_value;
+
+            // also init the lock mechanism
+            last_constant_time = millis();
+            lock_value = new_value;
+            updateLockValue(lock_value);
+
             return new_value;
         }
 
@@ -227,16 +248,433 @@ public:
         cv_readings[cursor] = new_value;
         cursor = (cursor + 1) & (TableSize - 1);
 
-        return summed_values >> NBits;
+        uint16_t ret_value = summed_values >> NBits;
+
+        last_filtered_value = ret_value;
+
+
+        // now looking at the locking mechanism
+        if ( (ret_value>=lock_interval_lower_bound) && (ret_value<=lock_interval_upper_bound) )
+        {
+            // we are within the lock area, check the timing
+
+            uint32_t curr_time = millis();
+            if (curr_time - last_constant_time > CVInHandler_lock_time)
+            {
+                // time is higher than the lock time, update it
+                if (!is_locked)
+                {
+                    //Serial.println("========== Just locked ==========");
+                    // increase the boundaries by 2 to stabilize well
+                    lock_interval_lower_bound -= 2;
+                    lock_interval_upper_bound += 2;
+
+                }
+
+                is_locked = true;
+                // update the time to avoid an overflow
+                // last_constant_time = curr_time - 3 * CVInHandler_lock_time;
+
+                return lock_value;
+            }
+            else
+            {
+                is_locked = false;
+                // update the lock value to get is close to the retval in order to avoid a gap when locking
+                updateLockValue(ret_value);
+
+                return ret_value;
+            }
+        }
+        else
+        {
+            //if (is_locked)
+            //    Serial.println("========== Just UNlocked ==========");
+
+            // not within the interval, reset everything and make the lock value track the current value
+            is_locked = false;
+
+            updateLockValue(ret_value);
+            last_constant_time = millis();
+
+            return ret_value;
+        }
+
+        return ret_value;
     }
 
+    bool isLocked() const { return is_locked; }
+
+    uint16_t getLockValue() const { return lock_value; }
+    int16_t getLockLowerBound() const { return lock_interval_lower_bound; }
+    int16_t getLockUpperBound() const { return lock_interval_upper_bound; }
+
+    void updateLockValue(uint16_t curr_value)
+    {
+        //static uint16_t corr_counter = 0;
+        // ret_val is used to know if we reset the timer
+        // bool ret_val = false;
+
+        
+
+
+        if ((curr_value<lock_interval_lower_bound) || (curr_value>lock_interval_upper_bound))
+        {
+            // the lock value is well outside the boundaries, update it strongly
+            if (curr_value<lock_interval_lower_bound)
+                // coming from above, we need to decrease the lock value
+                // just move it to the higher value that allows the current value inside the boundaries
+                lock_value = curr_value + CVInHandler_lock_threshold;
+            else
+                // coming from below, we need to increase the lock value
+                lock_value = curr_value - CVInHandler_lock_threshold;
+            // corr_counter = 0;
+            last_known_outside_value = curr_value;
+        }
+        else
+        {
+            // update the value as long as it is not too far from last_known_outside_value
+            uint16_t prev_lock = lock_value;
+
+            // not sure this mean calculation is actually useful
+            lock_value = (lock_value + curr_value) >> 1;
+
+            
+            if ((prev_lock==lock_value) && (lock_value!=curr_value))
+                // try to update anyway, this is for the extreme values mostly
+                lock_value = (curr_value>lock_value) ? lock_value+1 : lock_value-1;
+            
+
+            if (lock_value > last_known_outside_value + CVInHandler_lock_threshold)
+                lock_value = last_known_outside_value + CVInHandler_lock_threshold;
+            else if (lock_value < last_known_outside_value - CVInHandler_lock_threshold)
+                lock_value = last_known_outside_value - CVInHandler_lock_threshold;
+            
+            lock_value &= 0x3FF;  // ensuring that we stay within the boundaries
+        }
+
+        // determining the interval in which we consider that the input can be locked
+        // &0x03ff is there to ensure that we're within a 10 bits value bound
+        lock_interval_lower_bound = (lock_value - CVInHandler_lock_threshold);// & 0x3FF;
+        lock_interval_upper_bound = (lock_value + CVInHandler_lock_threshold);// & 0x3FF;
+
+        // return ret_val;
+    }
+
+    uint16_t lastReadValue() const { return last_read_value; }
+    uint16_t lastFilteredValue() const { return last_filtered_value; }
+    uint32_t lastReadingTime() const { return last_reading_time; }
+
 private:
+
+    uint16_t last_read_value;
+    uint16_t last_filtered_value;
+    uint32_t last_reading_time;
+
     bool isInitialized = false;
     uint8_t pin_to_read;
     uint8_t cursor = 0;
     uint32_t summed_values = 0;
     uint16_t cv_readings[TableSize];
+    bool is_locked = false;
+    bool lockable = true;
+    uint16_t lock_value;
+    int16_t last_known_outside_value; // this is to prevent the lock value from getting too far of an occasional extremum
+    int16_t lock_interval_lower_bound;
+    int16_t lock_interval_upper_bound;
+    uint32_t last_constant_time;
 };
+
+
+
+
+
+
+
+
+constexpr size_t CVInHandler_DualQuantile_window_1 = 7;
+constexpr size_t CVInHandler_DualQuantile_quant_1 = 4;
+constexpr size_t CVInHandler_DualQuantile_window_2 = 5;
+constexpr size_t CVInHandler_DualQuantile_quant_2 = 3;
+constexpr uint32_t CVInHandler_DualQuantile_lock_time = 4000;
+constexpr uint32_t CVInHandler_DualQuantile_unlock_time = 18;
+constexpr uint16_t CVInHandler_DualQuantile_lock_window = 3;
+
+
+
+class CVInHandler_DualQuantile {
+public:
+    explicit CVInHandler_DualQuantile(uint8_t pin) : pin_to_read(pin) {}
+
+    uint16_t readCV()
+    {
+        uint16_t new_value = analogRead(pin_to_read);
+
+        last_read_value = new_value;
+        last_reading_time = millis();
+
+        if (!isInitialized)
+        {
+            for (size_t i=0; i<CVInHandler_DualQuantile_window_1; ++i)
+            {
+                cv_readings_1[i] = new_value;
+                ordered_readings_1[i] = new_value;
+            }
+            for (size_t i=0; i<CVInHandler_DualQuantile_window_2; ++i)
+            {
+                cv_readings_2[i] = new_value;
+                ordered_readings_2[i] = new_value;
+            }
+            isInitialized = true;
+
+            is_locked = false;
+
+            // also init the lock mechanism
+            last_new_value_time = millis();
+            updateLockWindow(new_value);
+
+            return new_value;
+        }
+
+        uint16_t old_value_1 = cv_readings_1[cursor_1];
+        cv_readings_1[cursor_1] = new_value;
+        cursor_1 = (cursor_1 + 1) % CVInHandler_DualQuantile_window_1;
+
+        // remove the old value
+        for (size_t k_1=0; k_1<CVInHandler_DualQuantile_window_1; ++k_1)
+        {
+            if (ordered_readings_1[k_1]==old_value_1)
+            {
+                for (size_t k=k_1; k<CVInHandler_DualQuantile_window_1-1; ++k)
+                {
+                    ordered_readings_1[k] = ordered_readings_1[k+1];
+                }
+                break;
+            }
+        }
+
+        // insert the new value
+        bool inserted_1 = false;
+        for (size_t k_1=0; k_1<CVInHandler_DualQuantile_window_1-1; ++k_1)
+        {
+            if (ordered_readings_1[k_1]>new_value)
+            {
+                for (size_t k=CVInHandler_DualQuantile_window_1-1; k>k_1; --k)
+                {
+                    ordered_readings_1[k] = ordered_readings_1[k-1];
+                }
+                ordered_readings_1[k_1] = new_value;
+                inserted_1 = true;
+                break;
+            }
+        }
+        if (!inserted_1)
+            // the new value wasn't inserted, it should end up at the last position
+            ordered_readings_1[CVInHandler_DualQuantile_window_1-1] = new_value;
+
+        // result of the first layer of quantiles
+        uint16_t quantile_1 = ordered_readings_1[CVInHandler_DualQuantile_quant_1];
+
+
+        // now compute the second quantile layer
+
+        uint16_t old_value_2 = cv_readings_2[cursor_2];
+        cv_readings_2[cursor_2] = quantile_1;
+        cursor_2 = (cursor_2 + 1) % CVInHandler_DualQuantile_window_2;
+
+        // remove the old value
+        for (size_t k_2=0; k_2<CVInHandler_DualQuantile_window_2; ++k_2)
+        {
+            if (ordered_readings_2[k_2]==old_value_2)
+            {
+                for (size_t k=k_2; k<CVInHandler_DualQuantile_window_2-1; ++k)
+                {
+                    ordered_readings_2[k] = ordered_readings_2[k+1];
+                }
+                break;
+            }
+        }
+
+        // insert the new value
+        bool inserted_2 = false;
+        for (size_t k_2=0; k_2<CVInHandler_DualQuantile_window_2-1; ++k_2)
+        {
+            if (ordered_readings_2[k_2]>quantile_1)
+            {
+                for (size_t k=CVInHandler_DualQuantile_window_2-1; k>k_2; --k)
+                {
+                    ordered_readings_2[k] = ordered_readings_2[k-1];
+                }
+                ordered_readings_2[k_2] = quantile_1;
+                inserted_2 = true;
+                break;
+            }
+        }
+        if (!inserted_2)
+            // the new value wasn't inserted, it should end up at the last position
+            ordered_readings_2[CVInHandler_DualQuantile_window_2-1] = quantile_1;
+
+        // output of the second layer of quantiles
+        uint16_t ret_value = ordered_readings_1[CVInHandler_DualQuantile_quant_2];
+
+        // return ret_value;
+
+
+
+        // now looking at the locking mechanism
+
+        bool stable = (ret_value>=lock_interval_lower_bound) && (ret_value<=lock_interval_upper_bound);
+
+        if (!stable && !is_locked)
+        {
+            // unstable and not locked : record the new value, update the time
+            updateLockWindow(ret_value);
+            last_new_value_time = millis();
+            return ret_value;
+        }
+        else if (stable && !is_locked)
+        {
+            // we may be in a stable mode and switch to lock mode
+            uint32_t time = millis();
+            if (time - last_new_value_time > CVInHandler_DualQuantile_lock_time)
+            {
+                // we've been stable for long enough, we switch to lock mode
+                // update the lock value to reflect the exact current value
+                is_locked = true;
+                updateLockWindow(ret_value);
+                last_stable_value_time = time;
+                return lock_value;
+            }
+            else
+                return ret_value;
+        }
+        else if (stable and is_locked)
+        {
+            // stable and in lock mode : return the lock value
+            last_stable_value_time = millis();
+            return lock_value;
+        }
+        else
+        {
+            // not stable and locked
+            uint32_t time = millis();
+            if (time > last_stable_value_time + CVInHandler_DualQuantile_unlock_time)
+            {
+                // unstable for too long, leave the lock mode
+                is_locked = false;
+                last_new_value_time = time;
+                return ret_value;
+            }
+            else
+                // not unstable for long enough, return the lock value
+                return lock_value;
+        }
+    }
+
+    bool isLocked() const { return is_locked; }
+
+    uint16_t getLockValue() const { return lock_value; }
+    int16_t getLockLowerBound() const { return lock_interval_lower_bound; }
+    int16_t getLockUpperBound() const { return lock_interval_upper_bound; }
+
+    void updateLockWindow(uint16_t val)
+    {
+        lock_value = val;
+        lock_interval_lower_bound = (lock_value - CVInHandler_DualQuantile_lock_window) & 0x3FF;
+        lock_interval_upper_bound = (lock_value + CVInHandler_DualQuantile_lock_window) & 0x3FF;
+    }
+    /*
+    void updateLockValue(uint16_t curr_value)
+    {
+        //static uint16_t corr_counter = 0;
+        // ret_val is used to know if we reset the timer
+        // bool ret_val = false;
+
+        
+
+
+        if ((curr_value<lock_interval_lower_bound) || (curr_value>lock_interval_upper_bound))
+        {
+            // the lock value is well outside the boundaries, update it strongly
+            if (curr_value<lock_interval_lower_bound)
+                // coming from above, we need to decrease the lock value
+                // just move it to the higher value that allows the current value inside the boundaries
+                lock_value = curr_value + CVInHandler_lock_threshold;
+            else
+                // coming from below, we need to increase the lock value
+                lock_value = curr_value - CVInHandler_lock_threshold;
+            // corr_counter = 0;
+            last_known_outside_value = curr_value;
+        }
+        else
+        {
+            // update the value as long as it is not too far from last_known_outside_value
+            uint16_t prev_lock = lock_value;
+
+            // not sure this mean calculation is actually useful
+            lock_value = (lock_value + curr_value) >> 1;
+
+            
+            if ((prev_lock==lock_value) && (lock_value!=curr_value))
+                // try to update anyway, this is for the extreme values mostly
+                lock_value = (curr_value>lock_value) ? lock_value+1 : lock_value-1;
+            
+
+            if (lock_value > last_known_outside_value + CVInHandler_lock_threshold)
+                lock_value = last_known_outside_value + CVInHandler_lock_threshold;
+            else if (lock_value < last_known_outside_value - CVInHandler_lock_threshold)
+                lock_value = last_known_outside_value - CVInHandler_lock_threshold;
+            
+            lock_value &= 0x3FF;  // ensuring that we stay within the boundaries
+        }
+
+        // determining the interval in which we consider that the input can be locked
+        // &0x03ff is there to ensure that we're within a 10 bits value bound
+        lock_interval_lower_bound = (lock_value - CVInHandler_lock_threshold);// & 0x3FF;
+        lock_interval_upper_bound = (lock_value + CVInHandler_lock_threshold);// & 0x3FF;
+
+        // return ret_val;
+    }
+    */
+
+    uint16_t lastReadValue() const { return last_read_value; }
+    uint16_t lastFilteredValue() const { return last_filtered_value; }
+    uint32_t lastReadingTime() const { return last_reading_time; }
+
+private:
+
+    uint16_t last_read_value;
+    uint16_t last_filtered_value;
+    uint32_t last_reading_time;
+
+    bool isInitialized = false;
+    uint8_t pin_to_read;
+    uint16_t cv_readings_1[CVInHandler_DualQuantile_window_1];
+    uint16_t cv_readings_2[CVInHandler_DualQuantile_window_2];
+    uint16_t ordered_readings_1[CVInHandler_DualQuantile_window_1];
+    uint16_t ordered_readings_2[CVInHandler_DualQuantile_window_2];
+    size_t cursor_1 = 0;
+    size_t cursor_2 = 0;
+
+    bool is_locked = false;
+    bool lockable = true;
+
+    uint16_t lock_value;
+    int16_t lock_interval_lower_bound;
+    int16_t lock_interval_upper_bound;
+    
+    uint32_t last_stable_value_time;
+    uint32_t last_new_value_time;
+};
+
+
+
+
+
+
+
+
+
 
 
 
