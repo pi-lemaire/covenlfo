@@ -29,21 +29,34 @@ enum class CovenWaves: uint8_t {
 
 
 // timings in milliseconds to distinguish between different types of presses
-constexpr uint32_t ButtonPressTimeDebounce = 80;
-constexpr uint32_t ButtonPressTimeMid = 1000;
-constexpr uint32_t ButtonPressTimeLong = 3000;
+constexpr uint32_t ButtonPressTimeDebounce = 30;
+constexpr uint32_t ButtonPressDblClickInterv = 300;
+constexpr uint32_t ButtonPressTimeMid = 600;
+constexpr uint32_t ButtonPressTimeLong = 2000;
 
 
 // hopefully easier to understand and cleaner way to handle the button state
 enum class ButtonState : uint8_t {
     Undefined,
-    Short_Press,
+    Simple_Click,
+    Double_Click,
     Medium_Press,
     Long_Press,
     Released,
     Debounce_Check,
+    Dbl_Click_Check_LOW,
+    Dbl_Click_Check_HIGH,
     Pressed
 };
+
+
+enum class CovenInterfaceMode: uint8_t {
+    Main,
+    LFO_Edit,
+    Div_Edit,
+    Main_Edit
+};
+
 
 
 // always leave Count at the end. It's only used to cycle simply through the algos
@@ -517,9 +530,6 @@ public:
         // output of the second layer of quantiles
         uint16_t ret_value = ordered_readings_1[CVInHandler_DualQuantile_quant_2];
 
-        // return ret_value;
-
-
 
         // now looking at the locking mechanism
 
@@ -583,59 +593,6 @@ public:
         lock_interval_lower_bound = (lock_value - CVInHandler_DualQuantile_lock_window) & 0x3FF;
         lock_interval_upper_bound = (lock_value + CVInHandler_DualQuantile_lock_window) & 0x3FF;
     }
-    /*
-    void updateLockValue(uint16_t curr_value)
-    {
-        //static uint16_t corr_counter = 0;
-        // ret_val is used to know if we reset the timer
-        // bool ret_val = false;
-
-        
-
-
-        if ((curr_value<lock_interval_lower_bound) || (curr_value>lock_interval_upper_bound))
-        {
-            // the lock value is well outside the boundaries, update it strongly
-            if (curr_value<lock_interval_lower_bound)
-                // coming from above, we need to decrease the lock value
-                // just move it to the higher value that allows the current value inside the boundaries
-                lock_value = curr_value + CVInHandler_lock_threshold;
-            else
-                // coming from below, we need to increase the lock value
-                lock_value = curr_value - CVInHandler_lock_threshold;
-            // corr_counter = 0;
-            last_known_outside_value = curr_value;
-        }
-        else
-        {
-            // update the value as long as it is not too far from last_known_outside_value
-            uint16_t prev_lock = lock_value;
-
-            // not sure this mean calculation is actually useful
-            lock_value = (lock_value + curr_value) >> 1;
-
-            
-            if ((prev_lock==lock_value) && (lock_value!=curr_value))
-                // try to update anyway, this is for the extreme values mostly
-                lock_value = (curr_value>lock_value) ? lock_value+1 : lock_value-1;
-            
-
-            if (lock_value > last_known_outside_value + CVInHandler_lock_threshold)
-                lock_value = last_known_outside_value + CVInHandler_lock_threshold;
-            else if (lock_value < last_known_outside_value - CVInHandler_lock_threshold)
-                lock_value = last_known_outside_value - CVInHandler_lock_threshold;
-            
-            lock_value &= 0x3FF;  // ensuring that we stay within the boundaries
-        }
-
-        // determining the interval in which we consider that the input can be locked
-        // &0x03ff is there to ensure that we're within a 10 bits value bound
-        lock_interval_lower_bound = (lock_value - CVInHandler_lock_threshold);// & 0x3FF;
-        lock_interval_upper_bound = (lock_value + CVInHandler_lock_threshold);// & 0x3FF;
-
-        // return ret_val;
-    }
-    */
 
     uint16_t lastReadValue() const { return last_read_value; }
     uint16_t lastFilteredValue() const { return last_filtered_value; }

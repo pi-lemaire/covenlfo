@@ -42,9 +42,9 @@ constexpr uint32_t HZPHASOR = 91625;
 
 
 CovenSettings defaultPresets[] = {
-  CovenSettings({{ {1}, {16}, {48}, {80} }}, 16),
-  CovenSettings({{ {1}, {16}, {32}, {64} }}, 16),
-  CovenSettings({{ {1}, {8}, {32}, {128} }}, 8),
+  CovenSettings({{ {1}, {4}, {12}, {20} }}, 4),
+  CovenSettings({{ {1}, {4}, {8}, {16} }}, 4),
+  CovenSettings({{ {1}, {4}, {16}, {64} }}, 4),
   CovenSettings({{ {1, true, CovenWaves::Square}, {3, true, CovenWaves::RampDown}, {12.5f, false, CovenWaves::Random}, {19.2f, false, CovenWaves::Triangle} }}, 4.0f)
 };
 
@@ -297,14 +297,62 @@ ButtonState getButtonState(void)
     // we're in check mode, verify if enough time has elapsed
     if ((millis() - buttonPressTime) > ButtonPressTimeDebounce)
     {
-      // yes : is the button still pressed?
+      // more time than the debounce check has passed
+      // is the button still pressed?
       if (digitalRead(6) == LOW)
         // yes: ok this is not a bounce - next we will look at the time
-        knownState = ButtonState::Pressed;
+        // if there's a new click within a short interval, it's a dbl click
+        // otherwise it's a classic click, or a medium / long press
+        knownState = ButtonState::Dbl_Click_Check_LOW;
       else
         // no: this was not a real press
         knownState = ButtonState::Released;
         return ButtonState::Undefined;
+    }
+    // no else : we don't want to change the state if nothing was recorded
+  }
+
+  // now check the Double Click
+  if (knownState==ButtonState::Dbl_Click_Check_LOW)
+  {
+    if ((millis() - buttonPressTime) > ButtonPressDblClickInterv)
+    {
+      // we didn't have a release within the expected time, we're in normal press territory
+      knownState == ButtonState::Pressed;
+    }
+    else if (digitalRead(6) == HIGH)
+    {
+      // release within the dbl click interval time, we're still in possible DblClick Territory but we still need a push
+      knownState==ButtonState::Dbl_Click_Check_HIGH;
+    }
+  }
+
+  if (knownState==ButtonState::Dbl_Click_Check_HIGH)
+  {
+    if ((millis() - buttonPressTime) > ButtonPressDblClickInterv)
+    {
+      // we didn't have a new click within the time interval, we're in normal click territory
+      knownState == ButtonState::Pressed;
+    }
+    else if (digitalRead(6) == LOW)
+    {
+      // new click within the expected time, this is a double click
+      knownState = ButtonState::Double_Click;
+      
+      // record the click time for a debounce check
+      buttonPressTime = millis();
+
+      return ButtonState::Double_Click;
+    }
+  }
+
+  if (knownState==ButtonState::Double_Click)
+  {
+    // just wait for a new high status to resume to the original state
+    if ((digitalRead(6) == HIGH) && ((millis() - buttonPressTime) > ButtonPressTimeDebounce))
+    {
+      knownState = ButtonState::Released;
+      return ButtonState::Undefined;
     }
   }
 
@@ -328,7 +376,7 @@ ButtonState getButtonState(void)
       // ShortPress and MediumPress are only going to happen if it wasn't a long press already
       if (previously_not_long && ((currentTime - buttonPressTime) < ButtonPressTimeMid))
         //short press
-        return ButtonState::Short_Press;
+        return ButtonState::Simple_Click;
       else if (previously_not_long && ((currentTime - buttonPressTime) <= ButtonPressTimeLong))
         // medium press
         return ButtonState::Medium_Press;
@@ -611,7 +659,7 @@ void loop()
   ButtonState currentButtonState = getButtonState();
 
   // act accordingly
-  if (currentButtonState == ButtonState::Short_Press)
+  if (currentButtonState == ButtonState::Simple_Click)
   {
     // circulate through the waves
     if (interfaceMode == CovenAlgo::Classic)
