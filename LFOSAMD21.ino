@@ -234,10 +234,10 @@ void TCC0_Handler();
 void setup()
 {
   // for debugging purposes - comment out when not necessary
-  /*
+  
   Serial.begin(115200);
   while (!Serial) {}
-  */
+
   if (!Presets.load())
     Presets.save();
 
@@ -284,9 +284,48 @@ void setup()
 
 ButtonState getButtonState(void)
 {
+
+
   //static char buttonState = BUTTON_STATE_UP;
   static ButtonState knownState = ButtonState::Released;
+  //static ButtonState prevState = ButtonState::Released;
   static unsigned long int buttonPressTime = 0;
+
+  /*
+  if (prevState != knownState)
+  {
+    prevState =knownState;
+    switch(knownState)
+    {
+      case ButtonState::Released:
+        Serial.println("Released");
+        break;
+      case ButtonState::Undefined:
+        Serial.println("Undefined");
+        break;
+      case ButtonState::Dbl_Click_Check_HIGH:
+        Serial.println("Dbl_Click_Check_HIGH");
+        break;
+      case ButtonState::Dbl_Click_Check_LOW:
+        Serial.println("Dbl_Click_Check_LOW");
+        break;
+      case ButtonState::Debounce_Check:
+        Serial.println("Debounce_Check");
+        break;
+      case ButtonState::Pressed:
+        Serial.println("Double_Click");
+        break;
+      case ButtonState::Medium_Press:
+        Serial.println("Medium_Press");
+        break;
+      case ButtonState::Long_Press:
+        Serial.println("Long_Press");
+        break;
+      case ButtonState::Simple_Click:
+        Serial.println("Simple_Click");
+        break;
+    }
+  }*/
 
   if ( (knownState==ButtonState::Released) && (digitalRead(6)==LOW) )
   {
@@ -304,14 +343,19 @@ ButtonState getButtonState(void)
       // more time than the debounce check has passed
       // is the button still pressed?
       if (digitalRead(6) == LOW)
-        // yes: ok this is not a bounce - next we will look at the time
+      {
+        // yes and the button is still down: ok this is not a bounce - next we will look at the time
         // if there's a new click within a short interval, it's a dbl click
         // otherwise it's a classic click, or a medium / long press
         knownState = ButtonState::Dbl_Click_Check_LOW;
+        // return ButtonState::Undefined;
+      }
       else
+      {
         // no: this was not a real press
         knownState = ButtonState::Released;
         return ButtonState::Undefined;
+      }
     }
     // no else : we don't want to change the state if nothing was recorded
   }
@@ -321,38 +365,59 @@ ButtonState getButtonState(void)
   {
     if ((millis() - buttonPressTime) > ButtonPressDblClickInterv)
     {
-      // we didn't have a release within the expected time, we're in normal press territory
-      knownState == ButtonState::Pressed;
+      // more than the Dbl Click check time has elapsed: we're leaving the Dbl_Click_Check_LOW state anyway
+      if (digitalRead(6)==LOW)
+      {
+        // still pressed, and haven't found an instance when the button was up in between. Maybe a med/long press?
+        knownState = ButtonState::Pressed;
+      }
+      else
+      {
+        // we're up but didn't catch a Dbl_Click_Check_HIGH state: simple click
+        knownState = ButtonState::Released;
+        return ButtonState::Simple_Click;
+      }
     }
-    else if (digitalRead(6) == HIGH)
+    else
     {
-      // release within the dbl click interval time, we're still in possible DblClick Territory but we still need a push
-      knownState==ButtonState::Dbl_Click_Check_HIGH;
+      if (digitalRead(6) == HIGH)
+      {
+        // release within the dbl click interval time, we're in possible DblClick Territory but we still need a push
+        knownState = ButtonState::Dbl_Click_Check_HIGH;
+        return ButtonState::Undefined;
+      }
     }
   }
 
   if (knownState==ButtonState::Dbl_Click_Check_HIGH)
   {
-    if ((millis() - buttonPressTime) > ButtonPressDblClickInterv)
+    if ((millis() - buttonPressTime) <= ButtonPressDblClickInterv)
     {
-      // we didn't have a new click within the time interval, we're in normal click territory
-      knownState == ButtonState::Pressed;
-    }
-    else if (digitalRead(6) == LOW)
-    {
-      // new click within the expected time, this is a double click
-      knownState = ButtonState::Double_Click;
-      
-      // record the click time for a debounce check
-      buttonPressTime = millis();
+      // we've not reached the dbl click status yet
+      if (digitalRead(6) == LOW)
+      {
+        // new click within the expected time, this is a double click
+        knownState = ButtonState::Double_Click;
+        
+        // record the click time for a debounce check
+        buttonPressTime = millis();
 
-      return ButtonState::Double_Click;
+        return ButtonState::Double_Click;
+      }
+      // else : wait for a click or the expiry of the DoubleCLickInterv
     }
+    else
+    {
+      // the button has stayed released and we didn't have a new click within the time interval, we're in normal click territory
+      knownState = ButtonState::Released;
+      return ButtonState::Simple_Click;
+    }
+    // else: wait for the next iteration
   }
 
   if (knownState==ButtonState::Double_Click)
   {
-    // just wait for a new high status to resume to the original state
+    // just wait for a new high status to resume to the original state, or we might record a bounce click
     if ((digitalRead(6) == HIGH) && ((millis() - buttonPressTime) > ButtonPressTimeDebounce))
     {
       knownState = ButtonState::Released;
@@ -385,9 +450,11 @@ ButtonState getButtonState(void)
         // medium press
         return ButtonState::Medium_Press;
       else if ((currentTime - buttonPressTime) > ButtonPressTimeLong)
-        // avoid the unlikely event when the actual release happens before the check
-        buttonPressTime = currentTime;
-        return ButtonState::Long_Press;
+      {
+        knownState = ButtonState::Released;
+        return ButtonState::Undefined;
+      }
+
     }
     else if ((currentTime - buttonPressTime) > ButtonPressTimeLong)
     {
@@ -665,6 +732,8 @@ void loop()
   // act accordingly
   if (currentButtonState == ButtonState::Simple_Click)
   {
+    Serial.println("Simple Click received");
+
     // circulate through the waves
     if (interfaceMode == CovenAlgo::Classic)
     {
@@ -691,6 +760,8 @@ void loop()
   }
   else if (currentButtonState == ButtonState::Medium_Press)
   {
+    Serial.println("Medium Press received");
+
     // medium time press and release to change divisions
     if (interfaceMode == CovenAlgo::Classic)
     {      
@@ -721,12 +792,18 @@ void loop()
   }
   else if (currentButtonState == ButtonState::Long_Press)
   {
+    Serial.println("Long Press received");
+
     // change the interface mode
     ++interfaceMode; // = (interfaceMode + 1) % ALGOS_Number;
 
     if ((interfaceMode==CovenAlgo::Manual_Div) || (interfaceMode==CovenAlgo::Manual_Float))
       // we just switched to the manual mode, selectedWave has to be the first one
       selectedWave = 0;
+  }
+  else if (currentButtonState == ButtonState::Double_Click)
+  {
+    Serial.println("Double Click received");
   }
 
 
