@@ -26,6 +26,10 @@ constexpr uint32_t HZPHASOR = 91625;
 // we round to the lower value because it's probably better to have the clock lagging
 // back slightly behind the sync pulse when in sync
 
+constexpr uint8_t TRIGGER_LENGTH = 118;
+// what we want is to set counters in the main loop so that a trigger is 2.5ms long
+// TCC0 frequency is 46875 Hz which means that a cycle takes 0.021ms
+
 
 
 // first 3 presets are identical to the original CovenLFO code (int dividers, base tempo identical to sync, triangle waves)
@@ -960,6 +964,9 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
 
   // store the random values for cycles
   static uint16_t randNum[4];
+
+  // store the trigger counters
+  static uint8_t triggerCounts[4] = {0, 0, 0, 0};
   
   // unsigned long int is using 32 bits
   // so we keep the 9 outmost bits and base our calculation on those
@@ -1018,6 +1025,27 @@ uint16_t generator(uint32_t acc, CovenWaves waveshape, uint8_t channel, bool jus
 
       //previous_acc[channel] = shifted_acc;  
       return randNum[channel];
+
+    case CovenWaves::Trigger:
+      if (justCycled)
+      {
+        // initiate the countdown
+        triggerCounts[channel] = TRIGGER_LENGTH;
+        return 0;
+      }
+      else if (acc & 0x01<<31)
+      {
+        // halfwave, we return MAXPOINT anyway (which is actually a 0)
+        // this condition bypasses the 2.1ms threshold (~500 Hz) if the oscillator freq is greater than that
+        return MAXPOINT;
+      }
+      else if (triggerCounts[channel]>0)
+      {
+        triggerCounts[channel] -= 1;
+        return 0;
+      }
+      // trigger == 0, just return a low state
+      return MAXPOINT;
 
     default:
       return 0;

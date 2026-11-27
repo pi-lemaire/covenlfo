@@ -23,6 +23,7 @@ enum class CovenWaves: uint8_t {
     RampUp,
     Sine,
     Random,
+    Trigger,
     Count
 };
 
